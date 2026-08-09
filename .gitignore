@@ -1,0 +1,19 @@
+# Rust 构建产物
+/target/
+**/*.rs.bk
+
+# 截图自检输出
+/.shots*/
+
+# IDE
+/.vscode/
+/.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cargo lock（库不锁，二进制锁）
+# 注：这是 workspace 含二进制 crate，应提交 Cargo.lock

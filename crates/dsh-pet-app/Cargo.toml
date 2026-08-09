@@ -1,0 +1,48 @@
+[package]
+name = "dsh-pet-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "dsh-pet"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enable to bundle m4a decoding (symphonia aac+isomp4 adds ~800KB)
+m4a = ["symphonia/aac", "symphonia/isomp4"]
+
+[dependencies]
+dsh-pet-core = { path = "../dsh-pet-core" }
+dsh-pet-ui = { path = "../dsh-pet-ui" }
+winit = { version = "0.30", features = ["rwh_06"] }
+softbuffer = "0.4"
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+tray-icon = "0.14"
+rodio = { version = "0.19", default-features = false, features = ["symphonia-mp3", "symphonia-wav", "symphonia-vorbis", "symphonia-flac"] }
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "pcm", "vorbis", "flac"] }
+open = "5"
+single-instance = "0.3"
+directories = { workspace = true }
+rand = { workspace = true }
+ab_glyph = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+cocoa = "0.26"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux: no extra deps; tray-icon uses SNI D-Bus, fontconfig via fc-match command
