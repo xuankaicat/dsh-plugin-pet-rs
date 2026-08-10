@@ -1,5 +1,7 @@
 # DSH 桌宠（Rust 版）
 
+> ⚠️ 因为穷鲸组织的 GitHub Actions 账单额度问题无法运行，所以请自行构建。
+
 DeepSeek Harness 桌面宠物鲸鱼，Rust 原生实现，三端支持（Windows / macOS / Linux）。
 
 > 原 Electron 版见 `../dsh-pet/`。本版本用纯 Rust 重写，目标体积 < 10MB（原 ~100MB）。
