@@ -88,3 +88,8 @@ pub fn hide_dock() {}
 fn find_system_font(_name: &str) -> Option<PathBuf> {
     None
 }
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+/// 获取鼠标屏幕绝对坐标。不支持的平台返回 None，回退到 winit 相对坐标。
+pub fn cursor_screen_position() -> Option<(i32, i32)> {
+    None
+}

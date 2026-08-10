@@ -15,6 +15,11 @@ pub fn hide_dock() {
     // Linux 无统一 Dock API，空操作
 }
 
+/// 获取鼠标的屏幕绝对坐标（物理像素）。Linux 上返回 None，回退到 winit 相对坐标。
+pub fn cursor_screen_position() -> Option<(i32, i32)> {
+    None
+}
+
 /// 查找系统字体：优先用 fc-match 命令
 pub fn find_system_font(name: &str) -> Option<PathBuf> {
     // 先尝试常见路径

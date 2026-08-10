@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use ab_glyph::{point, Font, FontArc, ScaleFont};
 use dsh_pet_core::{Mode, Snapshot, SpritePack};
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Transform};
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Transform};
 
 use crate::emoji::EmojiAtlas;
 use crate::text::TextLayout;
@@ -24,15 +24,38 @@ const CANVAS_FULL_W: f32 = 240.0;
 const _CANVAS_FULL_H: f32 = 174.0;
 /// 气泡尺寸（styles.css #bubble）
 const BUBBLE_W: f32 = 252.0;
-/// 气泡圆角半径（预留，v1 用直角矩形简化）
-#[allow(dead_code)]
 const BUBBLE_RADIUS: f32 = 14.0;
+const SETTINGS_H: f32 = 132.0;
 /// 气泡背景色 rgba(14,26,78,0.92) ≈ alpha 235
 const BUBBLE_BG: [u8; 4] = [14, 26, 78, 235];
 /// 气泡与鲸鱼间距
 const GAP_NORMAL: f32 = 6.0;
 /// working/done 时水柱顶起的间距
 const GAP_SPRAY: f32 = 26.0;
+
+#[derive(Clone, Copy, Default)]
+struct HitRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl HitRect {
+    fn contains(self, x: f64, y: f64) -> bool {
+        let x = x as f32;
+        let y = y as f32;
+        x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsHit {
+    None,
+    ToggleSound,
+    Close,
+    EndpointInput,
+}
 
 pub struct Renderer {
     pixmap: Pixmap,
@@ -44,8 +67,21 @@ pub struct Renderer {
     /// 用户配置的鲸鱼舞台比例（0.5–1.1），只影响 stage，不影响气泡。
     pet_scale: f32,
     bubble_visible: bool,
+    settings_visible: bool,
+    sound_on: bool,
+    endpoint_text: String,
+    endpoint_cursor: usize,
+    endpoint_selection: Option<(usize, usize)>,
+    endpoint_undo: Option<(String, usize)>,
+    endpoint_preedit: Option<(String, Option<(usize, usize)>)>,
+    endpoint_focused: bool,
     mode_changed_at: Instant,
     pub scroll_offset: f32,
+    bubble_rect: Option<HitRect>,
+    stage_rect: Option<HitRect>,
+    settings_toggle_rect: Option<HitRect>,
+    settings_close_rect: Option<HitRect>,
+    settings_endpoint_rect: Option<HitRect>,
 }
 
 impl Renderer {
@@ -60,8 +96,21 @@ impl Renderer {
             dpi_scale,
             pet_scale,
             bubble_visible: true,
+            settings_visible: false,
+            sound_on: true,
+            endpoint_text: String::new(),
+            endpoint_cursor: 0,
+            endpoint_selection: None,
+            endpoint_undo: None,
+            endpoint_preedit: None,
+            endpoint_focused: false,
             mode_changed_at: Instant::now(),
             scroll_offset: 0.0,
+            bubble_rect: None,
+            stage_rect: None,
+            settings_toggle_rect: None,
+            settings_close_rect: None,
+            settings_endpoint_rect: None,
         }
     }
 
@@ -92,11 +141,42 @@ impl Renderer {
         let stage_scale = self.stage_scale();
         let whale_h = STAGE_FULL_H * stage_scale;
         let whale_y = self.pixmap.height() as f32 - whale_h - 6.0 * self.dpi_scale;
-        let bubble_h = self.measure_bubble_h(snapshot);
+        let bubble_h = if self.settings_visible {
+            SETTINGS_H * self.dpi_scale
+        } else {
+            self.measure_bubble_h(snapshot)
+        };
         let bubble_y = (whale_y - gap - bubble_h).max(0.0);
 
+        let stage_w = STAGE_FULL_W * stage_scale;
+        self.stage_rect = Some(HitRect {
+            x: (self.pixmap.width() as f32 - stage_w) / 2.0,
+            y: whale_y,
+            w: stage_w,
+            h: whale_h,
+        });
+
         if self.bubble_visible {
-            self.draw_bubble(snapshot, bubble_y, time_ms);
+            let bubble_w = BUBBLE_W * self.dpi_scale;
+            self.bubble_rect = Some(HitRect {
+                x: (self.pixmap.width() as f32 - bubble_w) / 2.0,
+                y: bubble_y,
+                w: bubble_w,
+                h: bubble_h + 9.0 * self.dpi_scale,
+            });
+            if self.settings_visible {
+                self.draw_settings(bubble_y, time_ms);
+            } else {
+                self.settings_toggle_rect = None;
+                self.settings_close_rect = None;
+                self.settings_endpoint_rect = None;
+                self.draw_bubble(snapshot, bubble_y, time_ms);
+            }
+        } else {
+            self.bubble_rect = None;
+            self.settings_toggle_rect = None;
+            self.settings_close_rect = None;
+            self.settings_endpoint_rect = None;
         }
         self.draw_whale(snapshot, whale_y, time_ms);
 
@@ -282,9 +362,13 @@ impl Renderer {
     // ============================ 气泡渲染 ============================
 
     fn measure_bubble_h(&self, snapshot: &Snapshot) -> f32 {
-        let title_h = 13.0 * self.dpi_scale + 3.0 * self.dpi_scale;
-        let body_line_h = 11.0 * self.dpi_scale * 1.5;
-        let body_lines = snapshot.bubble.body.lines().count().clamp(1, 6) as f32;
+        let title_h = 16.0 * self.dpi_scale + 4.0 * self.dpi_scale;
+        let body_line_h = 13.0 * self.dpi_scale * 1.5;
+        let layout = TextLayout::new(&self.font, 13.0 * self.dpi_scale);
+        let body_lines = layout
+            .layout(&snapshot.bubble.body, (BUBBLE_W - 28.0) * self.dpi_scale)
+            .len()
+            .clamp(1, 6) as f32;
         let padding = (10.0 + 12.0) * self.dpi_scale;
         title_h + body_line_h * body_lines + padding
     }
@@ -300,17 +384,8 @@ impl Renderer {
         let pop_progress = (elapsed / 400.0).min(1.0);
         let pop_alpha = pop_progress;
 
-        // 圆角矩形背景
-        let rect = match Rect::from_xywh(x, y, w, h) {
-            Some(r) => r,
-            None => return,
-        };
-        let mut path = PathBuilder::new();
-        path.push_rect(rect);
-        let path = match path.finish() {
-            Some(p) => p,
-            None => return,
-        };
+        self.draw_card_background(x, y, w, h, pop_alpha);
+
         let mut paint = Paint::default();
         paint.set_color_rgba8(
             BUBBLE_BG[0],
@@ -319,13 +394,6 @@ impl Renderer {
             (BUBBLE_BG[3] as f32 * pop_alpha) as u8,
         );
         paint.anti_alias = true;
-        self.pixmap.fill_path(
-            &path,
-            &paint,
-            FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
 
         // 三角尾巴（底部居中）
         let tail_x = x + w / 2.0;
@@ -346,24 +414,24 @@ impl Renderer {
             None,
         );
 
-        // 标题（bold 13px）
+        // 标题
         self.draw_text(
             &snapshot.bubble.title,
             x + 14.0 * self.dpi_scale,
             y + 10.0 * self.dpi_scale,
-            13.0 * self.dpi_scale,
+            16.0 * self.dpi_scale,
             Color::from_rgba8(255, 255, 255, 255),
             w - 28.0 * self.dpi_scale,
             pop_alpha,
         );
 
-        // 正文（11px，多行）
-        let body_y = y + (10.0 + 3.0 + 13.0) * self.dpi_scale;
-        let line_h = 11.0 * self.dpi_scale * 1.5;
-        let layout = TextLayout::new(&self.font, 11.0 * self.dpi_scale);
+        // 正文（13px，多行）
+        let body_y = y + (10.0 + 4.0 + 16.0) * self.dpi_scale;
+        let line_h = 13.0 * self.dpi_scale * 1.5;
+        let layout = TextLayout::new(&self.font, 13.0 * self.dpi_scale);
         let lines = layout.layout(&snapshot.bubble.body, w - 28.0 * self.dpi_scale);
 
-        let max_body_h = 108.0 * self.dpi_scale;
+        let max_body_h = h - (body_y - y) - 12.0 * self.dpi_scale;
         let visible_lines = ((max_body_h / line_h).floor() as usize)
             .max(1)
             .min(lines.len());
@@ -380,12 +448,262 @@ impl Renderer {
                 &line.text,
                 x + 14.0 * self.dpi_scale,
                 ly,
-                11.0 * self.dpi_scale,
+                13.0 * self.dpi_scale,
                 Color::from_rgba8(255, 255, 255, 209), // rgba(255,255,255,0.82)
                 w - 28.0 * self.dpi_scale,
                 pop_alpha,
             );
         }
+    }
+
+    fn draw_settings(&mut self, y: f32, time_ms: u64) {
+        let scale = self.dpi_scale;
+        let w = BUBBLE_W * scale;
+        let h = SETTINGS_H * scale;
+        let x = (self.pixmap.width() as f32 - w) / 2.0;
+        self.draw_card_background(x, y, w, h, 1.0);
+
+        // 标题 "设置"
+        self.draw_text(
+            "设置",
+            x + 14.0 * scale,
+            y + 10.0 * scale,
+            16.0 * scale,
+            Color::WHITE,
+            w - 56.0 * scale,
+            1.0,
+        );
+        // "×" 关闭按钮
+        self.draw_text(
+            "×",
+            x + w - 29.0 * scale,
+            y + 7.0 * scale,
+            18.0 * scale,
+            Color::from_rgba8(255, 255, 255, 210),
+            20.0 * scale,
+            1.0,
+        );
+        // "声音提醒" 标签
+        self.draw_text(
+            "声音提醒",
+            x + 14.0 * scale,
+            y + 48.0 * scale,
+            13.0 * scale,
+            Color::from_rgba8(255, 255, 255, 230),
+            130.0 * scale,
+            1.0,
+        );
+
+        // 声音开关 toggle
+        let toggle = HitRect {
+            x: x + w - 58.0 * scale,
+            y: y + 46.0 * scale,
+            w: 44.0 * scale,
+            h: 24.0 * scale,
+        };
+        let toggle_color = if self.sound_on {
+            Color::from_rgba8(92, 215, 170, 255)
+        } else {
+            Color::from_rgba8(91, 104, 150, 255)
+        };
+        self.fill_rounded_rect(toggle, 12.0 * scale, toggle_color);
+        let knob_x = if self.sound_on {
+            toggle.x + 32.0 * scale
+        } else {
+            toggle.x + 12.0 * scale
+        };
+        let mut knob = PathBuilder::new();
+        knob.push_circle(knob_x, toggle.y + 12.0 * scale, 8.0 * scale);
+        if let Some(path) = knob.finish() {
+            let mut paint = Paint::default();
+            paint.set_color(Color::WHITE);
+            paint.anti_alias = true;
+            self.pixmap.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+
+        // "DSH 地址" 标签
+        self.draw_text(
+            "DSH 地址",
+            x + 14.0 * scale,
+            y + 74.0 * scale,
+            13.0 * scale,
+            Color::from_rgba8(255, 255, 255, 230),
+            130.0 * scale,
+            1.0,
+        );
+
+        // endpoint 输入框
+        let input_rect = HitRect {
+            x: x + 10.0 * scale,
+            y: y + 94.0 * scale,
+            w: w - 20.0 * scale,
+            h: 28.0 * scale,
+        };
+        // 输入框背景
+        let bg_color = if self.endpoint_focused {
+            Color::from_rgba8(30, 50, 110, 235)
+        } else {
+            Color::from_rgba8(22, 38, 90, 200)
+        };
+        self.fill_rounded_rect(input_rect, 6.0 * scale, bg_color);
+        // 焦点边框
+        if self.endpoint_focused {
+            let border = HitRect {
+                x: input_rect.x,
+                y: input_rect.y,
+                w: input_rect.w,
+                h: input_rect.h,
+            };
+            let border_color = Color::from_rgba8(92, 160, 255, 200);
+            self.fill_rounded_rect(border, 6.0 * scale, border_color);
+            let inner = HitRect {
+                x: input_rect.x + 1.0 * scale,
+                y: input_rect.y + 1.0 * scale,
+                w: input_rect.w - 2.0 * scale,
+                h: input_rect.h - 2.0 * scale,
+            };
+            self.fill_rounded_rect(inner, 5.0 * scale, bg_color);
+        }
+
+        // endpoint 文本
+        let text_x = input_rect.x + 8.0 * scale;
+        let text_y = input_rect.y + 8.0 * scale;
+        let text_size = 13.0 * scale;
+        let text_max_w = input_rect.w - 16.0 * scale;
+
+        let has_preedit = self.endpoint_preedit.is_some();
+        let is_empty = self.endpoint_text.is_empty() && !has_preedit;
+
+        if is_empty && !self.endpoint_focused {
+            self.draw_text(
+                "点击输入…",
+                text_x,
+                text_y,
+                text_size,
+                Color::from_rgba8(255, 255, 255, 100),
+                text_max_w,
+                1.0,
+            );
+        } else {
+            let text_color = Color::from_rgba8(255, 255, 255, 235);
+            // 已确认文本（clone 避免与 draw_text 的 &mut self 冲突）
+            let confirmed = self.endpoint_text.clone();
+            let preedit_info = self.endpoint_preedit.clone();
+            let selection = self.endpoint_selection;
+            let confirmed_w = self.measure_text_width(&confirmed, text_size);
+
+            // 选区高亮背景
+            if let Some((sel_start, sel_end)) = selection {
+                let chars: Vec<char> = confirmed.chars().collect();
+                let before: String = chars[..sel_start].iter().collect();
+                let selected: String = chars[sel_start..sel_end].iter().collect();
+                let sel_x = text_x + self.measure_text_width(&before, text_size).min(text_max_w);
+                let sel_w = self.measure_text_width(&selected, text_size);
+                let sel_rect = HitRect {
+                    x: sel_x,
+                    y: text_y,
+                    w: sel_w,
+                    h: text_size + 2.0 * scale,
+                };
+                self.fill_rounded_rect(sel_rect, 2.0 * scale, Color::from_rgba8(92, 160, 255, 120));
+            }
+
+            self.draw_text(
+                &confirmed, text_x, text_y, text_size, text_color, text_max_w, 1.0,
+            );
+            // preedit 文本（紧接在已确认文本后）
+            if let Some((preedit, _)) = &preedit_info {
+                let preedit_x = text_x + confirmed_w.min(text_max_w);
+                let remaining = (text_max_w - confirmed_w.min(text_max_w)).max(0.0);
+                self.draw_text(
+                    preedit, preedit_x, text_y, text_size, text_color, remaining, 1.0,
+                );
+                // preedit 下划线
+                let preedit_w = self.measure_text_width(preedit, text_size).min(remaining);
+                let underline = HitRect {
+                    x: preedit_x,
+                    y: text_y + text_size + 1.0 * scale,
+                    w: preedit_w,
+                    h: 1.0 * scale,
+                };
+                self.fill_rounded_rect(underline, 0.0, Color::from_rgba8(150, 180, 255, 200));
+            }
+        }
+
+        // 光标（焦点时 500ms 闪烁）
+        if self.endpoint_focused && (time_ms / 500).is_multiple_of(2) {
+            if let Some(cursor_x) = self.endpoint_cursor_x(text_x, text_size, text_max_w) {
+                let cursor_rect = HitRect {
+                    x: cursor_x.round(),
+                    y: input_rect.y + 6.0 * scale,
+                    w: 1.0 * scale,
+                    h: 16.0 * scale,
+                };
+                self.fill_rounded_rect(cursor_rect, 0.0, Color::from_rgba8(255, 255, 255, 220));
+            }
+        }
+
+        self.settings_toggle_rect = Some(toggle);
+        self.settings_close_rect = Some(HitRect {
+            x: x + w - 42.0 * scale,
+            y,
+            w: 42.0 * scale,
+            h: 38.0 * scale,
+        });
+        self.settings_endpoint_rect = Some(input_rect);
+    }
+
+    fn draw_card_background(&mut self, x: f32, y: f32, w: f32, h: f32, alpha: f32) {
+        let scale = self.dpi_scale;
+        let layers = [
+            (12.0, 6.0, 12),
+            (8.0, 6.0, 18),
+            (4.0, 6.0, 28),
+            (1.0, 6.0, 32),
+        ];
+        for (spread, offset_y, opacity) in layers {
+            let rect = HitRect {
+                x: x - spread * scale,
+                y: y + offset_y * scale - spread * scale,
+                w: w + spread * 2.0 * scale,
+                h: h + spread * 2.0 * scale,
+            };
+            self.fill_rounded_rect(
+                rect,
+                (BUBBLE_RADIUS + spread) * scale,
+                Color::from_rgba8(10, 20, 60, (opacity as f32 * alpha) as u8),
+            );
+        }
+        self.fill_rounded_rect(
+            HitRect { x, y, w, h },
+            BUBBLE_RADIUS * scale,
+            Color::from_rgba8(
+                BUBBLE_BG[0],
+                BUBBLE_BG[1],
+                BUBBLE_BG[2],
+                (BUBBLE_BG[3] as f32 * alpha) as u8,
+            ),
+        );
+    }
+
+    fn fill_rounded_rect(&mut self, rect: HitRect, radius: f32, color: Color) {
+        let path = rounded_rect_path(rect.x, rect.y, rect.w, rect.h, radius);
+        let mut paint = Paint::default();
+        paint.set_color(color);
+        paint.anti_alias = true;
+        self.pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 
     // ============================ 文本渲染 ============================
@@ -434,14 +752,10 @@ impl Renderer {
                             if idx >= pixels.len() {
                                 return;
                             }
-                            let cov_a = coverage * alpha;
-                            let c = Color::from_rgba(
-                                color.red() * cov_a,
-                                color.green() * cov_a,
-                                color.blue() * cov_a,
-                                cov_a,
-                            )
-                            .unwrap_or(Color::TRANSPARENT);
+                            let cov_a = coverage * alpha * color.alpha();
+                            let c =
+                                Color::from_rgba(color.red(), color.green(), color.blue(), cov_a)
+                                    .unwrap_or(Color::TRANSPARENT);
                             pixels[idx] = c.premultiply().to_color_u8();
                         });
                         let paint = PixmapPaint::default();
@@ -468,6 +782,15 @@ impl Renderer {
         self.draw_text(&ch.to_string(), x, y, size, color, f32::MAX, alpha);
     }
 
+    /// 测量文本渲染宽度（像素），用于光标定位。
+    fn measure_text_width(&self, text: &str, size: f32) -> f32 {
+        let font = &self.font;
+        let scaled = font.as_scaled(size);
+        text.chars()
+            .map(|ch| scaled.h_advance(font.glyph_id(ch)))
+            .sum()
+    }
+
     // ============================ 状态变更接口 ============================
 
     /// 模式变化时重置 popIn 动画时钟
@@ -488,6 +811,272 @@ impl Renderer {
         self.bubble_visible = v;
     }
 
+    pub fn set_settings_visible(&mut self, visible: bool) {
+        self.settings_visible = visible;
+    }
+
+    pub fn settings_visible(&self) -> bool {
+        self.settings_visible
+    }
+
+    pub fn set_sound_on(&mut self, sound_on: bool) {
+        self.sound_on = sound_on;
+    }
+
+    pub fn set_endpoint_text(&mut self, text: String) {
+        let len = text.chars().count();
+        self.endpoint_text = text;
+        self.endpoint_cursor = len;
+        self.endpoint_selection = None;
+        self.endpoint_undo = None;
+        self.endpoint_preedit = None;
+    }
+
+    pub fn endpoint_text(&self) -> &str {
+        &self.endpoint_text
+    }
+
+    pub fn endpoint_cursor(&self) -> usize {
+        self.endpoint_cursor
+    }
+
+    pub fn set_endpoint_cursor(&mut self, pos: usize) {
+        let len = self.endpoint_text.chars().count();
+        self.endpoint_cursor = pos.min(len);
+    }
+
+    pub fn endpoint_preedit(&self) -> &Option<(String, Option<(usize, usize)>)> {
+        &self.endpoint_preedit
+    }
+
+    pub fn set_endpoint_preedit(&mut self, preedit: Option<(String, Option<(usize, usize)>)>) {
+        self.endpoint_preedit = preedit;
+    }
+
+    pub fn move_cursor_left(&mut self) {
+        if self.endpoint_cursor > 0 {
+            self.endpoint_cursor -= 1;
+        }
+        self.endpoint_selection = None;
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        let len = self.endpoint_text.chars().count();
+        if self.endpoint_cursor < len {
+            self.endpoint_cursor += 1;
+        }
+        self.endpoint_selection = None;
+    }
+
+    pub fn move_cursor_home(&mut self) {
+        self.endpoint_cursor = 0;
+        self.endpoint_selection = None;
+    }
+
+    pub fn move_cursor_end(&mut self) {
+        let len = self.endpoint_text.chars().count();
+        self.endpoint_cursor = len;
+        self.endpoint_selection = None;
+    }
+
+    // ============================ 选择 / 剪贴板 ============================
+
+    pub fn select_all_endpoint(&mut self) {
+        let len = self.endpoint_text.chars().count();
+        self.endpoint_selection = Some((0, len));
+        self.endpoint_cursor = len;
+    }
+
+    pub fn endpoint_selection(&self) -> Option<(usize, usize)> {
+        self.endpoint_selection
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        self.endpoint_selection.map(|(s, e)| {
+            let chars: Vec<char> = self.endpoint_text.chars().collect();
+            chars[s..e].iter().collect()
+        })
+    }
+
+    /// 删除当前选中的文本，返回是否确实删除了内容。
+    pub fn delete_selection(&mut self) -> bool {
+        let (s, e) = match self.endpoint_selection {
+            Some(v) => v,
+            None => return false,
+        };
+        let chars: Vec<char> = self.endpoint_text.chars().collect();
+        let mut new_chars = chars[..s].to_vec();
+        new_chars.extend_from_slice(&chars[e..]);
+        self.endpoint_text = new_chars.into_iter().collect();
+        self.endpoint_cursor = s;
+        self.endpoint_selection = None;
+        true
+    }
+
+    /// 在光标处插入文本（若有选区则替换）。保存 undo 快照。
+    pub fn insert_text_at_cursor(&mut self, text: &str) {
+        self.save_undo();
+        if self.delete_selection() {
+            // selection 已删除，继续在 cursor 处插入
+        }
+        self.endpoint_preedit = None;
+        let byte_pos = self
+            .endpoint_text
+            .char_indices()
+            .nth(self.endpoint_cursor)
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| self.endpoint_text.len());
+        self.endpoint_text.insert_str(byte_pos, text);
+        self.endpoint_cursor += text.chars().count();
+    }
+
+    /// 删除光标前一个字符（Backspace）。保存 undo。
+    pub fn backspace_at_cursor(&mut self) {
+        if self.endpoint_selection.is_some() {
+            self.save_undo();
+            self.delete_selection();
+            return;
+        }
+        if self.endpoint_cursor == 0 || self.endpoint_text.is_empty() {
+            return;
+        }
+        self.save_undo();
+        let char_pos = self.endpoint_cursor - 1;
+        let byte_pos = self
+            .endpoint_text
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| self.endpoint_text.len());
+        let next_byte = self.endpoint_text[byte_pos..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| byte_pos + i)
+            .unwrap_or_else(|| self.endpoint_text.len());
+        self.endpoint_text.replace_range(byte_pos..next_byte, "");
+        self.endpoint_cursor -= 1;
+    }
+
+    /// 删除光标后一个字符（Delete）。保存 undo。
+    pub fn delete_at_cursor(&mut self) {
+        if self.endpoint_selection.is_some() {
+            self.save_undo();
+            self.delete_selection();
+            return;
+        }
+        let len = self.endpoint_text.chars().count();
+        if self.endpoint_cursor >= len {
+            return;
+        }
+        self.save_undo();
+        let byte_pos = self
+            .endpoint_text
+            .char_indices()
+            .nth(self.endpoint_cursor)
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| self.endpoint_text.len());
+        let next_byte = self.endpoint_text[byte_pos..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| byte_pos + i)
+            .unwrap_or_else(|| self.endpoint_text.len());
+        self.endpoint_text.replace_range(byte_pos..next_byte, "");
+    }
+
+    // ============================ Undo ============================
+
+    fn save_undo(&mut self) {
+        self.endpoint_undo = Some((self.endpoint_text.clone(), self.endpoint_cursor));
+    }
+
+    pub fn undo(&mut self) {
+        if let Some((text, cursor)) = self.endpoint_undo.take() {
+            self.endpoint_text = text;
+            self.endpoint_cursor = cursor;
+            self.endpoint_selection = None;
+            self.endpoint_preedit = None;
+        }
+    }
+
+    pub fn set_endpoint_focused(&mut self, focused: bool) {
+        self.endpoint_focused = focused;
+        if !focused {
+            self.endpoint_preedit = None;
+            self.endpoint_selection = None;
+        }
+    }
+
+    pub fn endpoint_focused(&self) -> bool {
+        self.endpoint_focused
+    }
+
+    /// 输入框区域（物理像素），用于设置 IME 光标区域。
+    pub fn endpoint_ime_area(&self) -> Option<(f32, f32, f32, f32)> {
+        self.settings_endpoint_rect.map(|r| (r.x, r.y, r.w, r.h))
+    }
+
+    /// 计算光标 x 坐标（物理像素）。preedit cursor 为 None 时返回 None。
+    fn endpoint_cursor_x(&self, text_x: f32, text_size: f32, text_max_w: f32) -> Option<f32> {
+        if let Some((preedit, preedit_cursor)) = &self.endpoint_preedit {
+            match preedit_cursor {
+                Some((start, _)) => {
+                    let start = (*start).min(preedit.len());
+                    let safe = preedit
+                        .char_indices()
+                        .take_while(|(i, _)| *i <= start)
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    let mut s = self.endpoint_text.clone();
+                    s.push_str(&preedit[..safe]);
+                    Some(text_x + self.measure_text_width(&s, text_size).min(text_max_w))
+                }
+                None => None,
+            }
+        } else {
+            let chars_before: String = self
+                .endpoint_text
+                .chars()
+                .take(self.endpoint_cursor)
+                .collect();
+            Some(
+                text_x
+                    + self
+                        .measure_text_width(&chars_before, text_size)
+                        .min(text_max_w),
+            )
+        }
+    }
+
+    pub fn is_bubble_hit(&self, x: f64, y: f64) -> bool {
+        self.bubble_rect.is_some_and(|rect| rect.contains(x, y))
+    }
+
+    pub fn is_whale_region(&self, x: f64, y: f64) -> bool {
+        self.stage_rect.is_some_and(|rect| rect.contains(x, y))
+    }
+
+    pub fn settings_hit_test(&self, x: f64, y: f64) -> SettingsHit {
+        if self
+            .settings_close_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            SettingsHit::Close
+        } else if self
+            .settings_endpoint_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            SettingsHit::EndpointInput
+        } else if self
+            .settings_toggle_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            SettingsHit::ToggleSound
+        } else {
+            SettingsHit::None
+        }
+    }
+
     /// 是否需要持续动画（用于决定是否 request_redraw）
     pub fn is_animating(mode: Mode) -> bool {
         mode.is_animating()
@@ -495,6 +1084,9 @@ impl Renderer {
 
     /// 像素级命中检测：窗口坐标 (x, y) 是否落在非透明像素上
     pub fn is_whale_hit(&self, x: f64, y: f64) -> bool {
+        if !self.is_whale_region(x, y) {
+            return false;
+        }
         let px = x as u32;
         let py = y as u32;
         if px >= self.pixmap.width() || py >= self.pixmap.height() {
@@ -505,6 +1097,23 @@ impl Renderer {
             .map(|c| c.alpha() > 0)
             .unwrap_or(false)
     }
+}
+
+fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> tiny_skia::Path {
+    let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+    let k = r * 0.552_284_8;
+    let mut path = PathBuilder::new();
+    path.move_to(x + r, y);
+    path.line_to(x + w - r, y);
+    path.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    path.line_to(x + w, y + h - r);
+    path.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    path.line_to(x + r, y + h);
+    path.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    path.line_to(x, y + r);
+    path.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    path.close();
+    path.finish().expect("rounded rectangle path")
 }
 
 // ============================ 缓动 / 动画函数 ============================

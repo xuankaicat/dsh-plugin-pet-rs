@@ -9,6 +9,6 @@ pub mod text;
 pub mod window;
 
 pub use emoji::EmojiAtlas;
-pub use input::{drag_delta, InputAction, InputState};
-pub use renderer::Renderer;
+pub use input::{drag_delta, ClickDecision, ClickTarget, ClickTracker, InputAction, InputState};
+pub use renderer::{Renderer, SettingsHit};
 pub use window::create_window;

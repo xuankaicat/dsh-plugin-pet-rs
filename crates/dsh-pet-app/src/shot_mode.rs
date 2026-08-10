@@ -1,4 +1,4 @@
-//! 截图自检模式：--shot [输出目录] → 5 状态 × 3 时间点 → PNG
+//! 截图自检模式：--shot [输出目录] → 状态动画与设置面板 PNG
 //!
 //! 对应 main.js L603-677 的 runShotMode()。
 
@@ -37,6 +37,35 @@ pub fn run_shot_mode(output_dir: &Path) -> anyhow::Result<()> {
             tracing::info!("已截图: {name}");
         }
     }
+    renderer.set_settings_visible(true);
+    renderer.set_sound_on(true);
+    renderer.set_endpoint_text("http://127.0.0.1:3080".to_string());
+    let snapshot = fake_snapshot(Mode::Idle);
+    let _ = renderer.render(&snapshot, 0);
+    let path = output_dir.join("settings-sound-on.png");
+    renderer.pixmap().save_png(&path)?;
+    tracing::info!("已截图: settings-sound-on.png");
+
+    renderer.set_sound_on(false);
+    let _ = renderer.render(&snapshot, 0);
+    let path = output_dir.join("settings-sound-off.png");
+    renderer.pixmap().save_png(&path)?;
+    tracing::info!("已截图: settings-sound-off.png");
+
+    // endpoint 焦点状态截图
+    renderer.set_endpoint_focused(true);
+    renderer.set_sound_on(true);
+    let _ = renderer.render(&snapshot, 0);
+    let path = output_dir.join("settings-endpoint-focus.png");
+    renderer.pixmap().save_png(&path)?;
+    tracing::info!("已截图: settings-endpoint-focus.png");
+
+    // preedit 状态截图（模拟中文输入法预编辑）
+    renderer.set_endpoint_preedit(Some(("本地主机".to_string(), Some((4, 4)))));
+    let _ = renderer.render(&snapshot, 0);
+    let path = output_dir.join("settings-endpoint-preedit.png");
+    renderer.pixmap().save_png(&path)?;
+    tracing::info!("已截图: settings-endpoint-preedit.png");
     Ok(())
 }
 

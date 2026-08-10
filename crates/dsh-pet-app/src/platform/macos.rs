@@ -17,6 +17,11 @@ pub fn hide_dock() {
     }
 }
 
+/// 获取鼠标的屏幕绝对坐标（物理像素）。macOS 上返回 None，回退到 winit 相对坐标。
+pub fn cursor_screen_position() -> Option<(i32, i32)> {
+    None
+}
+
 /// 查找系统字体
 pub fn find_system_font(name: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;

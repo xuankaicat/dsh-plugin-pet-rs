@@ -3,7 +3,7 @@
 //! 对应 main.js L314-374 的 trayIcon() + buildMenu()。
 
 use std::sync::Mutex;
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 /// 托盘菜单动作
@@ -11,7 +11,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 pub enum TrayAction {
     OpenGui,
     ToggleBubble,
-    ToggleSound(bool),
+    ToggleSound,
     TestSound,
     ScaleUp,
     ScaleDown,
@@ -34,11 +34,22 @@ struct MenuIds {
 /// 全局存储菜单项 ID（tray-icon 的事件回调是全局静态的）
 static MENU_IDS: Mutex<Option<MenuIds>> = Mutex::new(None);
 
+pub struct TrayUi {
+    _icon: TrayIcon,
+    sound_item: CheckMenuItem,
+}
+
+impl TrayUi {
+    pub fn set_sound_on(&self, sound_on: bool) {
+        self.sound_item.set_checked(sound_on);
+    }
+}
+
 /// 创建托盘图标和菜单。
 ///
 /// 返回 `(TrayIcon, Vec<TrayAction>)` — TrayIcon 必须存活，Vec 用于收集初始化时的动作（通常为空）。
 /// 后续菜单事件通过 `tray_icon::menu::MenuEvent::receiver()` 全局通道获取。
-pub fn create(sound_on: bool, bubble_visible: bool, scale: f32) -> Option<TrayIcon> {
+pub fn create(sound_on: bool, bubble_visible: bool, scale: f32) -> Option<TrayUi> {
     let icon = load_tray_icon();
 
     let menu = Menu::new();
@@ -52,15 +63,7 @@ pub fn create(sound_on: bool, bubble_visible: bool, scale: f32) -> Option<TrayIc
         true,
         None,
     );
-    let sound = MenuItem::new(
-        if sound_on {
-            "✓ 状态提示音"
-        } else {
-            "  状态提示音"
-        },
-        true,
-        None,
-    );
+    let sound = CheckMenuItem::new("状态提示音", true, sound_on, None);
     let test_sound = MenuItem::new("测试提示音", true, None);
     let sep1 = PredefinedMenuItem::separator();
     let scale_label = MenuItem::new(format!("鲸鱼大小 {}%", (scale * 100.0) as u32), false, None);
@@ -104,7 +107,10 @@ pub fn create(sound_on: bool, bubble_visible: bool, scale: f32) -> Option<TrayIc
         .build()
         .ok()?;
 
-    Some(tray)
+    Some(TrayUi {
+        _icon: tray,
+        sound_item: sound,
+    })
 }
 
 /// 尝试从全局 MenuEvent 通道轮询一个托盘动作
@@ -117,8 +123,7 @@ pub fn poll_action() -> Option<TrayAction> {
     } else if event.id == ids.toggle_bubble {
         TrayAction::ToggleBubble
     } else if event.id == ids.sound {
-        // 切换提示音状态（具体 on/off 由调用方维护）
-        TrayAction::ToggleSound(true) // 占位，实际值由调用方决定
+        TrayAction::ToggleSound
     } else if event.id == ids.test_sound {
         TrayAction::TestSound
     } else if event.id == ids.scale_up {

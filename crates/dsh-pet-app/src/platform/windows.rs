@@ -10,6 +10,17 @@ pub fn hide_dock() {
     // Windows 无 Dock 概念；skip_taskbar 已在窗口属性中设置
 }
 
+/// 获取鼠标的屏幕绝对坐标（物理像素）。
+pub fn cursor_screen_position() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut point = POINT::default();
+    unsafe {
+        GetCursorPos(&mut point).ok()?;
+    }
+    Some((point.x, point.y))
+}
+
 /// 查找系统字体
 pub fn find_system_font(name: &str) -> Option<PathBuf> {
     let win_dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
