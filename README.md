@@ -1,3 +1,5 @@
+本项目已被dshfind.com收录
+
 # DSH 桌宠（Rust 版）
 
 > ⚠️ 因为穷鲸组织的 GitHub Actions 账单额度问题无法运行，所以请自行构建。
