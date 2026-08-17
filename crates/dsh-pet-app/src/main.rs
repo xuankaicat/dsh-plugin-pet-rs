@@ -882,8 +882,9 @@ fn update_click_through(
             use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
             use windows::Win32::Foundation::HWND;
             use windows::Win32::UI::WindowsAndMessaging::{
-                GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
-                WS_EX_TRANSPARENT,
+                GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_LAYERED,
+                WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
             };
             if let Ok(handle) = window.window_handle() {
                 if let RawWindowHandle::Win32(w32) = handle.as_raw() {
@@ -893,6 +894,9 @@ fn update_click_through(
                         let mut new_ex = ex;
                         // 始终保留 TOOLWINDOW：防止出现在任务栏
                         new_ex |= WS_EX_TOOLWINDOW.0 as i32;
+                        // LAYERED 是 WS_EX_TRANSPARENT 点击穿透的前提（非 layered 窗口的
+                        // TRANSPARENT 只影响绘制顺序，不穿透鼠标）
+                        new_ex |= WS_EX_LAYERED.0 as i32;
                         if transparent {
                             new_ex |= WS_EX_TRANSPARENT.0 as i32;
                         } else {
@@ -900,6 +904,18 @@ fn update_click_through(
                         }
                         if new_ex != ex {
                             SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex as i32);
+                            // 必须 SetWindowPos(SWP_FRAMECHANGED) 让系统重新评估样式，
+                            // 否则 WS_EX_TRANSPARENT 不生效（点击穿透失效）。
+                            let _ = SetWindowPos(
+                                hwnd,
+                                windows::Win32::UI::WindowsAndMessaging::HWND_TOP,
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED
+                                    | SWP_NOACTIVATE,
+                            );
                         }
                     }
                 }
