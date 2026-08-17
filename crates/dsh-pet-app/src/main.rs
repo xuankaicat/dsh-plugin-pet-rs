@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
     // 当前窗口是否为点击穿透状态（避免重复切换窗口样式）
     let mut click_through = false;
     // 由桌宠启动的 DSH 子进程（共享槽；关闭开关/退出时回收）
-    let dsh_child: Arc<Mutex<Option<tokio::process::Child>>> = Arc::new(Mutex::new(None));
+    let dsh_child: Arc<Mutex<Option<child_dsh::ChildGuard>>> = Arc::new(Mutex::new(None));
     // 启动任务代际号：关闭/重启时 +1，使在途的旧启动任务失效
     let dsh_gen = Arc::new(AtomicU64::new(0));
     // 启动时检测默认端口是否已有 DSH：有则关闭子进程模式，直接连接现有实例
@@ -392,7 +392,7 @@ fn main() -> anyhow::Result<()> {
                                         renderer.set_confirm_stop_dsh(false);
                                         config.spawn_dsh = false;
                                         renderer.set_spawn_dsh(false);
-                                        stop_dsh_child(&rt, &dsh_child, &dsh_gen);
+                                        stop_dsh_child(&dsh_child, &dsh_gen);
                                         let manual = config.normalized_endpoint();
                                         if dsh_url != manual {
                                             dsh_url = manual.clone();
@@ -413,7 +413,7 @@ fn main() -> anyhow::Result<()> {
                                     SettingsHit::RestartDsh => {
                                         // 重启桌宠托管的 DSH 子进程（仅 spawn_dsh 模式显示按钮）
                                         if config.spawn_dsh {
-                                            stop_dsh_child(&rt, &dsh_child, &dsh_gen);
+                                            stop_dsh_child(&dsh_child, &dsh_gen);
                                             renderer.set_endpoint_text("重启中…".into());
                                             spawn_dsh_task(
                                                 &rt,
@@ -722,8 +722,8 @@ fn main() -> anyhow::Result<()> {
                 }
                 net_cancel.cancel();
                 app_cancel.cancel();
-                // 回收由桌宠启动的 DSH 子进程
-                stop_dsh_child_on_exit(&rt, &dsh_child, &dsh_gen);
+                // 回收由桌宠启动的 DSH 子进程（guard drop 同步杀进程树）
+                stop_dsh_child(&dsh_child, &dsh_gen);
             }
             _ => {}
         }
@@ -871,7 +871,7 @@ fn update_click_through(
 fn spawn_dsh_task(
     rt: &tokio::runtime::Runtime,
     proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
-    slot: &Arc<Mutex<Option<tokio::process::Child>>>,
+    slot: &Arc<Mutex<Option<child_dsh::ChildGuard>>>,
     gen: &Arc<AtomicU64>,
     generation: u64,
 ) {
@@ -885,9 +885,8 @@ fn spawn_dsh_task(
                     *slot.lock().unwrap() = Some(spawned.child);
                     let _ = proxy.send_event(UserEvent::DshChildUrl(spawned.url));
                 } else {
-                    // 已被关闭/重启取代：回收这个过期子进程
-                    let mut child = spawned.child;
-                    child_dsh::kill(&mut child).await;
+                    // 已被关闭/重启取代：drop guard 自动杀进程树回收
+                    drop(spawned.child);
                 }
             }
             Err(msg) => {
@@ -901,32 +900,15 @@ fn spawn_dsh_task(
 }
 
 /// 停止 DSH 子进程（若有），并让在途的启动任务失效（代际 +1）。
-/// 回收在后台异步进行，不阻塞事件循环（避免 taskkill 卡住界面）。
+/// ChildGuard 的 Drop 会同步 taskkill /T 杀进程树（含 cmd→node 整棵树），
+/// 因此无需阻塞/异步等待。
 fn stop_dsh_child(
-    rt: &tokio::runtime::Runtime,
-    slot: &Arc<Mutex<Option<tokio::process::Child>>>,
+    slot: &Arc<Mutex<Option<child_dsh::ChildGuard>>>,
     gen: &Arc<AtomicU64>,
 ) {
     gen.fetch_add(1, Ordering::SeqCst);
     let child = slot.lock().unwrap().take();
-    if let Some(mut c) = child {
-        rt.spawn(async move {
-            child_dsh::kill(&mut c).await;
-        });
-    }
-}
-
-/// 桌宠退出时同步回收 DSH 子进程（进程即将结束，阻塞可接受，确保子进程被回收）。
-fn stop_dsh_child_on_exit(
-    rt: &tokio::runtime::Runtime,
-    slot: &Arc<Mutex<Option<tokio::process::Child>>>,
-    gen: &Arc<AtomicU64>,
-) {
-    gen.fetch_add(1, Ordering::SeqCst);
-    let child = slot.lock().unwrap().take();
-    if let Some(mut c) = child {
-        rt.block_on(child_dsh::kill(&mut c));
-    }
+    drop(child);
 }
 
 /// 快速探测默认端口是否已有 DSH 服务（任何 <500 的 HTTP 响应都视为已占用）。

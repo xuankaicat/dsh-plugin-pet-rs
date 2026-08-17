@@ -21,8 +21,48 @@ const NPX_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 成功拉起并解析出地址的子进程
 pub struct SpawnedDsh {
-    pub child: Child,
+    pub child: ChildGuard,
     pub url: String,
+}
+
+/// 进程树回收 guard：任何路径（任务 abort / drop / 正常回收）下，
+/// drop 都会同步终止整个子进程树（Windows 用 taskkill /T /F）。
+pub struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    pub fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// 可变访问内部 Child（如取 stderr 管道）。
+    pub fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("ChildGuard 已空")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            #[cfg(target_os = "windows")]
+            {
+                // cmd shim 会再拉起 node，必须按进程树终止
+                if let Some(pid) = child.id() {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let mut child = child;
+                let _ = child.start_kill();
+            }
+        }
+    }
 }
 
 /// 按优先级依次尝试所有候选启动方式，返回第一个解析出地址的。
@@ -92,8 +132,10 @@ async fn try_launch(program: &str, args: &[&str], wait: Duration) -> Result<Spaw
         Some(s) => s,
         None => return Err(format!("{program}: 无法接管 stdout")),
     };
+    // 立即包上回收 guard：此后任何路径（含任务被 abort）drop 都会杀进程树
+    let mut guard = ChildGuard::new(child);
     // 排空 stderr（避免管道阻塞；同时记录日志）
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = guard.child_mut().stderr.take() {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -104,15 +146,9 @@ async fn try_launch(program: &str, args: &[&str], wait: Duration) -> Result<Spaw
 
     let result = timeout(wait, read_url(stdout)).await;
     match result {
-        Ok(Ok(url)) => Ok(SpawnedDsh { child, url }),
-        Ok(Err(e)) => {
-            kill(&mut child).await;
-            Err(format!("{program}: {e}"))
-        }
-        Err(_) => {
-            kill(&mut child).await;
-            Err(format!("{program}: 启动超时（{}s 内未输出地址）", wait.as_secs()))
-        }
+        Ok(Ok(url)) => Ok(SpawnedDsh { child: guard, url }),
+        Ok(Err(e)) => Err(format!("{program}: {e}")),
+        Err(_) => Err(format!("{program}: 启动超时（{}s 内未输出地址）", wait.as_secs())),
     }
 }
 
@@ -131,30 +167,6 @@ async fn read_url(stdout: ChildStdout) -> Result<String, String> {
 fn extract_url(line: &str) -> Option<String> {
     line.split_once("http://")
         .map(|(_, rest)| format!("http://{}", rest.trim()))
-}
-
-/// 终止 DSH 子进程。
-///
-/// Windows 上 `cmd` shim 会再拉起 node 进程，需按进程树（taskkill /T）一并终止；
-/// 其他平台直接 kill 即可。
-pub async fn kill(child: &mut Child) {
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(pid) = child.id() {
-            let mut tk = Command::new("taskkill");
-            tk.args(["/PID", &pid.to_string(), "/T", "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            // CREATE_NO_WINDOW：回收时也不闪现控制台窗口
-            tk.creation_flags(0x0800_0000);
-            let _ = tk.status().await;
-        }
-        let _ = child.kill().await;
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = child.kill().await;
-    }
 }
 
 #[cfg(test)]
@@ -176,39 +188,82 @@ mod tests {
         assert_eq!(extract_url(""), None);
     }
 
-    /// kill 必须能终止进程树且不挂起（异步路径）。
-    #[tokio::test]
-    async fn kill_terminates_child_tree() {
-        let mut child = Command::new("cmd")
+    /// ChildGuard drop 必须能终止整棵进程树且不挂起（同步路径）。
+    #[test]
+    fn guard_drop_kills_process_tree() {
+        let child = Command::new("cmd")
             .args(["/C", "ping", "-n", "30", "127.0.0.1"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        kill(&mut child).await;
-        let exited = tokio::time::timeout(Duration::from_secs(5), child.wait())
-            .await
-            .expect("kill 后子进程应在 5s 内退出")
-            .unwrap();
-        assert!(exited.success() || !exited.success());
+        let mut guard = ChildGuard::new(child);
+        let pid = guard.child_mut().id().unwrap();
+        drop(guard);
+        // 同步 taskkill 后，进程应在数秒内消失
+        let gone = std::time::Instant::now();
+        loop {
+            let alive = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            assert!(
+                gone.elapsed() < Duration::from_secs(10),
+                "guard drop 后进程 {pid} 应在 10s 内退出"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
-    /// 与事件循环中 stop_dsh_child 相同的 block_on(kill) 模式不得死锁。
-    #[test]
-    fn kill_via_block_on_completes() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut child = rt.block_on(async {
-            Command::new("cmd")
-                .args(["/C", "ping", "-n", "30", "127.0.0.1"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap()
+    /// 模拟任务被 abort：guard 在 async 块内 drop，子进程也必须被回收。
+    #[tokio::test]
+    async fn guard_drop_on_abort_kills_child() {
+        let pid_slot = std::sync::Arc::new(std::sync::Mutex::new(None::<u32>));
+        let task = tokio::spawn({
+            let pid_slot = pid_slot.clone();
+            async move {
+                let child = Command::new("cmd")
+                    .args(["/C", "ping", "-n", "30", "127.0.0.1"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let mut g = ChildGuard::new(child);
+                let pid = g.child_mut().id().unwrap();
+                *pid_slot.lock().unwrap() = Some(pid);
+                // 永远不返回：任务稍后被 abort，guard 随任务 drop
+                std::future::pending::<()>().await;
+            }
         });
-        rt.block_on(kill(&mut child));
-        assert!(child.try_wait().unwrap().is_some());
+        // 等任务启动并注册 pid
+        let pid = loop {
+            if let Some(pid) = *pid_slot.lock().unwrap() {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        task.abort();
+        let _ = task.await;
+        // abort 后 guard drop → 进程树被杀
+        let gone = std::time::Instant::now();
+        loop {
+            let alive = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            assert!(
+                gone.elapsed() < Duration::from_secs(10),
+                "abort 后进程 {pid} 应在 10s 内退出"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
