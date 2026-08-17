@@ -861,8 +861,41 @@ fn update_click_through(
     };
     if *current != transparent {
         *current = transparent;
-        // hittest = true → 接收鼠标事件（不穿透）
-        let _ = window.set_cursor_hittest(!transparent);
+        // 不用 winit 的 set_cursor_hittest：它重建窗口样式时会丢失
+        // WS_EX_TOOLWINDOW（SKIP_TASKBAR 未映射），导致任务栏出现桌宠。
+        // 改为原生 SetWindowLong 只切换 WS_EX_TRANSPARENT，并强制保留 TOOLWINDOW。
+        #[cfg(target_os = "windows")]
+        {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+                WS_EX_TRANSPARENT,
+            };
+            if let Ok(handle) = window.window_handle() {
+                if let RawWindowHandle::Win32(w32) = handle.as_raw() {
+                    let hwnd = HWND(w32.hwnd.get() as *mut _);
+                    unsafe {
+                        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as i32;
+                        let mut new_ex = ex;
+                        // 始终保留 TOOLWINDOW：防止出现在任务栏
+                        new_ex |= WS_EX_TOOLWINDOW.0 as i32;
+                        if transparent {
+                            new_ex |= WS_EX_TRANSPARENT.0 as i32;
+                        } else {
+                            new_ex &= !(WS_EX_TRANSPARENT.0 as i32);
+                        }
+                        if new_ex != ex {
+                            SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex as i32);
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = window.set_cursor_hittest(!transparent);
+        }
     }
 }
 
