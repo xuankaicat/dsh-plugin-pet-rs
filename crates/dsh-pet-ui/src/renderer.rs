@@ -1179,6 +1179,22 @@ impl Renderer {
             .map(|c| c.alpha() > 0)
             .unwrap_or(false)
     }
+
+    /// 判断窗口坐标（物理像素）处是否完全透明，用于透明区域点击穿透。
+    pub fn is_transparent_at(&self, x: f32, y: f32) -> bool {
+        if x < 0.0 || y < 0.0 {
+            return true;
+        }
+        let px = x as u32;
+        let py = y as u32;
+        if px >= self.pixmap.width() || py >= self.pixmap.height() {
+            return true;
+        }
+        self.pixmap
+            .pixel(px, py)
+            .map(|c| c.alpha() == 0)
+            .unwrap_or(true)
+    }
 }
 
 fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> tiny_skia::Path {

@@ -41,6 +41,9 @@ enum UserEvent {
     TrayAction(tray::TrayAction),
 }
 
+/// 透明区域点击穿透的轮询间隔（毫秒）
+const CLICK_THROUGH_POLL_MS: u64 = 100;
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -161,6 +164,8 @@ fn main() -> anyhow::Result<()> {
     let mut last_mode = Mode::Starting;
     let mut modifiers = winit::keyboard::ModifiersState::empty();
     let start_time = Instant::now();
+    // 当前窗口是否为点击穿透状态（避免重复切换窗口样式）
+    let mut click_through = false;
 
     // 主事件循环
     event_loop.run(move |event, elwt| {
@@ -541,6 +546,8 @@ fn main() -> anyhow::Result<()> {
                     let _ = proxy.send_event(UserEvent::TrayAction(action));
                 }
                 let now = Instant::now();
+                // 透明区域点击穿透：轮询光标下像素，动态切换窗口命中测试
+                update_click_through(&window, &renderer, &input, &mut click_through);
                 // 气泡浮入/浮出动画期间 60fps 持续重绘
                 let bubble_deadline = if renderer.bubble_animating() {
                     Some(now + Duration::from_millis(16))
@@ -555,15 +562,17 @@ fn main() -> anyhow::Result<()> {
                 };
                 let needs_redraw = bubble_deadline.is_some() || settings_deadline.is_some();
                 let deadline = bubble_deadline.into_iter().chain(settings_deadline).min();
+                // 至少每 100ms 唤醒一次：点击穿透时窗口收不到鼠标事件，需靠轮询恢复命中
+                let poll_deadline = now + Duration::from_millis(CLICK_THROUGH_POLL_MS);
                 match deadline {
                     Some(d) => {
-                        elwt.set_control_flow(ControlFlow::WaitUntil(d));
+                        elwt.set_control_flow(ControlFlow::WaitUntil(d.min(poll_deadline)));
                         if needs_redraw {
                             window.request_redraw();
                         }
                     }
                     None => {
-                        elwt.set_control_flow(ControlFlow::Wait);
+                        elwt.set_control_flow(ControlFlow::WaitUntil(poll_deadline));
                     }
                 }
             }
@@ -643,6 +652,34 @@ fn toggle_bubble(config: &mut Config, renderer: &mut Renderer, tray_ui: Option<&
         tray.set_bubble_visible(config.bubble_visible);
     }
     config.save();
+}
+
+/// 透明区域点击穿透：定期检查光标下像素是否完全透明，
+/// 动态切换窗口是否接收鼠标事件（Windows 上通过 WS_EX_TRANSPARENT 实现）。
+fn update_click_through(
+    window: &winit::window::Window,
+    renderer: &Renderer,
+    input: &InputState,
+    current: &mut bool,
+) {
+    let transparent = if input.is_down() {
+        // 拖拽/按下期间保持可交互，避免穿透打断拖拽
+        false
+    } else {
+        match (platform::cursor_screen_position(), window.inner_position()) {
+            (Some((sx, sy)), Ok(inner)) => {
+                let cx = sx - inner.x;
+                let cy = sy - inner.y;
+                renderer.is_transparent_at(cx as f32, cy as f32)
+            }
+            _ => false,
+        }
+    };
+    if *current != transparent {
+        *current = transparent;
+        // hittest = true → 接收鼠标事件（不穿透）
+        let _ = window.set_cursor_hittest(!transparent);
+    }
 }
 
 /// 若 endpoint 输入框有焦点，提交编辑：校验 → 热切换 → 失焦。
