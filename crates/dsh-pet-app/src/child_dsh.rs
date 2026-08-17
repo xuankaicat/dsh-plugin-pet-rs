@@ -47,13 +47,15 @@ impl Drop for ChildGuard {
         if let Some(child) = self.child.take() {
             #[cfg(target_os = "windows")]
             {
-                // cmd shim 会再拉起 node，必须按进程树终止
+                // cmd shim 会再拉起 node，必须按进程树终止。
+                // 用 spawn 不等待（fire-and-forget）：drop 里同步等待 taskkill
+                // 会阻塞事件循环导致桌宠卡死。
                 if let Some(pid) = child.id() {
                     let _ = std::process::Command::new("taskkill")
                         .args(["/PID", &pid.to_string(), "/T", "/F"])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
-                        .status();
+                        .spawn();
                 }
             }
             #[cfg(not(target_os = "windows"))]
