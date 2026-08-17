@@ -166,9 +166,16 @@ async fn read_url(stdout: ChildStdout) -> Result<String, String> {
 }
 
 /// 从 "dsh web: http://127.0.0.1:12345" 之类的行提取 URL。
+/// 只取到首个空白字符为止，避免把行尾 "(LAN: http://...)" 之类的附加说明带进 URL。
 fn extract_url(line: &str) -> Option<String> {
-    line.split_once("http://")
-        .map(|(_, rest)| format!("http://{}", rest.trim()))
+    for scheme in ["http://", "https://"] {
+        if let Some(start) = line.find(scheme) {
+            let rest = &line[start + scheme.len()..];
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            return Some(format!("{scheme}{}", &rest[..end]));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -181,6 +188,14 @@ mod tests {
         assert_eq!(
             extract_url("dsh web: http://127.0.0.1:63198"),
             Some("http://127.0.0.1:63198".to_string())
+        );
+    }
+
+    #[test]
+    fn truncates_trailing_lan_annotation() {
+        assert_eq!(
+            extract_url("dsh web: http://127.0.0.1:3080 (LAN: http://172.29.32.1:3080)"),
+            Some("http://127.0.0.1:3080".to_string())
         );
     }
 
