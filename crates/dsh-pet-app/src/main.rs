@@ -4,6 +4,10 @@
 //
 // winit 0.30 的 EventLoop::run / create_window 已标记 deprecated（建议用 run_app），
 // v1 仍用 run + 闭包形式（迁移到 ApplicationHandler trait 是 v2 待办）。
+//
+// release 版在 Windows 上以 GUI 子系统链接：双击 exe 纯 GUI 启动，不弹控制台窗口（CLI）。
+// debug 构建保持控制台子系统，便于开发时在终端查看日志。
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![allow(deprecated)]
 
 mod audio;
