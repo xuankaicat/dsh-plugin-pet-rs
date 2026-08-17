@@ -9,8 +9,12 @@ fn main() {
         let mut res = winres::WindowsResource::new();
         // 路径相对于 crate 根（crates/dsh-pet-app）→ 工作区根 assets/
         res.set_icon("../../assets/tray-icon.ico");
+        // 文件属性/任务管理器详细信息里的描述与产品名
+        res.set("FileDescription", "DSH 桌宠");
+        res.set("ProductName", "DSH 桌宠");
+        res.set("OriginalFilename", "dsh-pet.exe");
         if let Err(e) = res.compile() {
-            println!("cargo:warning=图标资源编译失败（不影响构建）: {e}");
+            println!("cargo:warning=图标/版本资源编译失败（不影响构建）: {e}");
         }
     }
 }
