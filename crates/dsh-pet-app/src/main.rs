@@ -48,7 +48,9 @@ enum UserEvent {
 }
 
 /// 透明区域点击穿透的轮询间隔（毫秒）
-const CLICK_THROUGH_POLL_MS: u64 = 100;
+const CLICK_THROUGH_POLL_MS: u64 = 200;
+/// 动画帧间隔（毫秒）：鲸鱼/气泡/设置面板的持续重绘按此节流，避免忙循环吃满 CPU
+const ANIM_FRAME_MS: u64 = 33;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -175,6 +177,9 @@ fn main() -> anyhow::Result<()> {
     let start_time = Instant::now();
     // 当前窗口是否为点击穿透状态（避免重复切换窗口样式）
     let mut click_through = false;
+    // 动画限帧：下一帧绘制时间点；点击穿透轮询时间戳
+    let mut next_frame: Option<Instant> = None;
+    let mut last_poll = Instant::now();
     // 由桌宠启动的 DSH 子进程（共享槽；关闭开关/退出时回收）
     let dsh_child: Arc<Mutex<Option<child_dsh::ChildGuard>>> = Arc::new(Mutex::new(None));
     // 启动任务代际号：关闭/重启时 +1，使在途的旧启动任务失效
@@ -225,10 +230,8 @@ fn main() -> anyhow::Result<()> {
                         }
                         let _ = buffer.present();
                     }
-                    if Renderer::is_animating(last_snapshot.mode) || renderer.bubble_animating()
-                    {
-                        window.request_redraw();
-                    }
+                    // 注：不在这里 request_redraw —— 那会造成无渲染循环吃满 CPU。
+                    // 帧节奏由 AboutToWait 里的 ANIM_FRAME_MS 节流控制。
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     input.update_cursor(position.x, position.y);
@@ -684,34 +687,31 @@ fn main() -> anyhow::Result<()> {
                     let _ = proxy.send_event(UserEvent::TrayAction(action));
                 }
                 let now = Instant::now();
-                // 透明区域点击穿透：轮询光标下像素，动态切换窗口命中测试
-                update_click_through(&window, &renderer, &input, &mut click_through);
-                // 气泡浮入/浮出动画期间 60fps 持续重绘
-                let bubble_deadline = if renderer.bubble_animating() {
-                    Some(now + Duration::from_millis(16))
-                } else {
-                    None
-                };
-                // 设置面板展开时 60fps 持续重绘（光标闪烁、preedit 动画）
-                let settings_deadline = if renderer.settings_visible() {
-                    Some(now + Duration::from_millis(16))
-                } else {
-                    None
-                };
-                let needs_redraw = bubble_deadline.is_some() || settings_deadline.is_some();
-                let deadline = bubble_deadline.into_iter().chain(settings_deadline).min();
-                // 至少每 100ms 唤醒一次：点击穿透时窗口收不到鼠标事件，需靠轮询恢复命中
-                let poll_deadline = now + Duration::from_millis(CLICK_THROUGH_POLL_MS);
-                match deadline {
-                    Some(d) => {
-                        elwt.set_control_flow(ControlFlow::WaitUntil(d.min(poll_deadline)));
-                        if needs_redraw {
-                            window.request_redraw();
-                        }
+                // 透明区域点击穿透：低频轮询（穿透时窗口收不到鼠标事件，需靠轮询恢复命中）
+                if now.duration_since(last_poll) >= Duration::from_millis(CLICK_THROUGH_POLL_MS) {
+                    last_poll = now;
+                    update_click_through(&window, &renderer, &input, &mut click_through);
+                }
+                // 动画限帧：鲸鱼/气泡/设置面板需要持续重绘时，按 ANIM_FRAME_MS 节流。
+                // 必须用时间检查再 request_redraw —— 直接 request 会立即触发下一帧，
+                // 造成无渲染循环（CPU 满载）。
+                let animating = renderer.bubble_animating()
+                    || renderer.settings_visible()
+                    || Renderer::is_animating(last_snapshot.mode);
+                if animating {
+                    let next = next_frame.unwrap_or(now);
+                    if now >= next {
+                        next_frame = Some(now + Duration::from_millis(ANIM_FRAME_MS));
+                        elwt.set_control_flow(ControlFlow::WaitUntil(next_frame.unwrap()));
+                        window.request_redraw();
+                    } else {
+                        elwt.set_control_flow(ControlFlow::WaitUntil(next));
                     }
-                    None => {
-                        elwt.set_control_flow(ControlFlow::WaitUntil(poll_deadline));
-                    }
+                } else {
+                    next_frame = None;
+                    elwt.set_control_flow(ControlFlow::WaitUntil(
+                        now + Duration::from_millis(CLICK_THROUGH_POLL_MS),
+                    ));
                 }
             }
             Event::LoopExiting => {
