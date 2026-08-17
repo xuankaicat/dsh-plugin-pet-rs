@@ -43,7 +43,7 @@ objc = "0.2"
 cocoa = "0.26"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows = { version = "0.58", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Graphics_Gdi"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux: no extra deps; tray-icon uses SNI D-Bus, fontconfig via fc-match command

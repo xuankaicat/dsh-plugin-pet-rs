@@ -37,3 +37,6 @@ pub fn find_system_font(name: &str) -> Option<PathBuf> {
         .find(|p| std::path::Path::new(p).exists())
         .map(PathBuf::from)
 }
+
+/// 确保窗口位于可见显示器上（该平台暂不干预，系统自行管理窗口位置）。
+pub fn ensure_window_on_screen(_window: &winit::window::Window) {}

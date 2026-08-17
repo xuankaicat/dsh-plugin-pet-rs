@@ -11,12 +11,14 @@
 #![allow(deprecated)]
 
 mod audio;
+mod child_dsh;
 mod platform;
 mod shot_mode;
 mod tasks;
 mod tray;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dsh_pet_core::{Config, Mode, PetState, Snapshot, StateEvent};
@@ -39,6 +41,10 @@ enum UserEvent {
     Snapshot(Snapshot),
     /// 托盘菜单动作
     TrayAction(tray::TrayAction),
+    /// DSH 子进程就绪，携带实际地址
+    DshChildUrl(String),
+    /// DSH 子进程启动失败
+    DshChildFailed(String),
 }
 
 /// 透明区域点击穿透的轮询间隔（毫秒）
@@ -136,6 +142,8 @@ fn main() -> anyhow::Result<()> {
 
     // 创建窗口
     let window = Arc::new(create_window(&event_loop, &config)?);
+    // 无论如何先保证桌宠显示在可见屏幕上（winit 在本机监视器尺寸/DPI 有误，可能把窗口放到屏幕外）
+    platform::ensure_window_on_screen(&window);
 
     // 创建 softbuffer surface — 用 Arc<Window> 避免 window 被 display_handle/window_handle 借用
     // （Arc<Window> 实现了 HasDisplayHandle + HasWindowHandle，且为 'static 无生命周期依赖）
@@ -149,6 +157,7 @@ fn main() -> anyhow::Result<()> {
     let mut renderer = Renderer::new(sprites.clone(), font, scale, dpi);
     renderer.set_bubble_visible(config.bubble_visible);
     renderer.set_sound_on(config.sound_on);
+    renderer.set_spawn_dsh(config.spawn_dsh);
     let mut input = InputState::new();
     let audio = AudioPlayer::new();
 
@@ -166,6 +175,23 @@ fn main() -> anyhow::Result<()> {
     let start_time = Instant::now();
     // 当前窗口是否为点击穿透状态（避免重复切换窗口样式）
     let mut click_through = false;
+    // 由桌宠启动的 DSH 子进程（共享槽；关闭开关/退出时回收）
+    let dsh_child: Arc<Mutex<Option<tokio::process::Child>>> = Arc::new(Mutex::new(None));
+    // 启动任务代际号：关闭/重启时 +1，使在途的旧启动任务失效
+    let dsh_gen = Arc::new(AtomicU64::new(0));
+    // 启动时检测默认端口是否已有 DSH：有则关闭子进程模式，直接连接现有实例
+    if config.spawn_dsh && dsh_server_running(&rt, &http) {
+        tracing::info!(
+            "检测到 {} 已有 DSH 服务，关闭「由桌宠启动 DSH」并直接连接",
+            Config::ENDPOINT_DEFAULT
+        );
+        config.spawn_dsh = false;
+        renderer.set_spawn_dsh(false);
+        config.save();
+    }
+    if config.spawn_dsh {
+        spawn_dsh_task(&rt, &proxy, &dsh_child, &dsh_gen, dsh_gen.load(Ordering::SeqCst));
+    }
 
     // 主事件循环
     event_loop.run(move |event, elwt| {
@@ -314,6 +340,65 @@ fn main() -> anyhow::Result<()> {
                                         window.set_ime_allowed(false);
                                         renderer.set_endpoint_text(dsh_url.clone());
                                         renderer.set_settings_visible(false);
+                                    }
+                                    SettingsHit::SpawnDsh => {
+                                        if config.spawn_dsh {
+                                            // 关闭子进程模式：先弹面板内确认（不再用原生 MessageBox）
+                                            renderer.set_confirm_stop_dsh(true);
+                                            window.request_redraw();
+                                        } else {
+                                            // 开启子进程模式：地址框显示「启动中…」，后台拉起
+                                            config.spawn_dsh = true;
+                                            renderer.set_spawn_dsh(true);
+                                            renderer.set_endpoint_text("启动中…".into());
+                                            spawn_dsh_task(
+                                                &rt,
+                                                &proxy,
+                                                &dsh_child,
+                                                &dsh_gen,
+                                                dsh_gen.load(Ordering::SeqCst),
+                                            );
+                                            config.save();
+                                            window.request_redraw();
+                                        }
+                                    }
+                                    SettingsHit::ConfirmStopDshYes => {
+                                        // 确认关闭：停止子进程，恢复手动地址
+                                        renderer.set_confirm_stop_dsh(false);
+                                        config.spawn_dsh = false;
+                                        renderer.set_spawn_dsh(false);
+                                        stop_dsh_child(&rt, &dsh_child, &dsh_gen);
+                                        let manual = config.normalized_endpoint();
+                                        if dsh_url != manual {
+                                            dsh_url = manual.clone();
+                                            renderer.set_endpoint_text(manual.clone());
+                                            net_cancel.cancel();
+                                            net_cancel = spawn_network_tasks(
+                                                &rt, &dsh_url, &http, event_tx.clone(),
+                                            );
+                                        }
+                                        config.save();
+                                        window.request_redraw();
+                                    }
+                                    SettingsHit::ConfirmStopDshNo => {
+                                        // 取消：保持开启
+                                        renderer.set_confirm_stop_dsh(false);
+                                        window.request_redraw();
+                                    }
+                                    SettingsHit::RestartDsh => {
+                                        // 重启桌宠托管的 DSH 子进程（仅 spawn_dsh 模式显示按钮）
+                                        if config.spawn_dsh {
+                                            stop_dsh_child(&rt, &dsh_child, &dsh_gen);
+                                            renderer.set_endpoint_text("重启中…".into());
+                                            spawn_dsh_task(
+                                                &rt,
+                                                &proxy,
+                                                &dsh_child,
+                                                &dsh_gen,
+                                                dsh_gen.load(Ordering::SeqCst),
+                                            );
+                                            window.request_redraw();
+                                        }
                                     }
                                     SettingsHit::None => {
                                         // 点击面板空白区域 → 提交 endpoint 编辑并失焦
@@ -538,7 +623,24 @@ fn main() -> anyhow::Result<()> {
                     &audio,
                     tray_ui.as_ref(),
                     &dsh_url,
+                    elwt,
                 );
+                window.request_redraw();
+            }
+            Event::UserEvent(UserEvent::DshChildUrl(url)) => {
+                // DSH 子进程就绪 → 热切换连接
+                if !url.is_empty() && url != dsh_url {
+                    tracing::info!("DSH 子进程就绪: {url}");
+                    dsh_url = url.clone();
+                    renderer.set_endpoint_text(url.clone());
+                    net_cancel.cancel();
+                    net_cancel = spawn_network_tasks(&rt, &dsh_url, &http, event_tx.clone());
+                }
+                window.request_redraw();
+            }
+            Event::UserEvent(UserEvent::DshChildFailed(msg)) => {
+                tracing::error!("DSH 子进程启动失败: {msg}");
+                renderer.set_endpoint_text("启动失败".into());
                 window.request_redraw();
             }
             Event::AboutToWait => {
@@ -584,6 +686,8 @@ fn main() -> anyhow::Result<()> {
                 }
                 net_cancel.cancel();
                 app_cancel.cancel();
+                // 回收由桌宠启动的 DSH 子进程
+                stop_dsh_child_on_exit(&rt, &dsh_child, &dsh_gen);
             }
             _ => {}
         }
@@ -600,6 +704,7 @@ fn handle_tray_action(
     audio: &AudioPlayer,
     tray_ui: Option<&tray::TrayUi>,
     dsh_url: &str,
+    elwt: &winit::event_loop::ActiveEventLoop,
 ) {
     use tray::TrayAction;
     match action {
@@ -630,9 +735,9 @@ fn handle_tray_action(
             set_scale(config, renderer, Config::SCALE_DEFAULT);
         }
         TrayAction::Quit => {
-            // 注：事件循环退出需要通过 elwt.exit()，此处仅保存配置
+            // 通过 elwt.exit() 正常退出，让 LoopExiting 回收 DSH 子进程并保存配置
             config.save();
-            std::process::exit(0);
+            elwt.exit();
         }
     }
 }
@@ -681,6 +786,93 @@ fn update_click_through(
         let _ = window.set_cursor_hittest(!transparent);
     }
 }
+
+/// 后台启动 DSH 子进程：内部级联尝试「dsh」→「npx @deepseek-ai/dsh」，
+/// 成功后把子进程放入共享槽并通知事件循环热切换连接。
+fn spawn_dsh_task(
+    rt: &tokio::runtime::Runtime,
+    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    slot: &Arc<Mutex<Option<tokio::process::Child>>>,
+    gen: &Arc<AtomicU64>,
+    generation: u64,
+) {
+    let proxy = proxy.clone();
+    let slot = slot.clone();
+    let gen = gen.clone();
+    rt.spawn(async move {
+        match child_dsh::start().await {
+            Ok(spawned) => {
+                if gen.load(Ordering::SeqCst) == generation {
+                    *slot.lock().unwrap() = Some(spawned.child);
+                    let _ = proxy.send_event(UserEvent::DshChildUrl(spawned.url));
+                } else {
+                    // 已被关闭/重启取代：回收这个过期子进程
+                    let mut child = spawned.child;
+                    child_dsh::kill(&mut child).await;
+                }
+            }
+            Err(msg) => {
+                if gen.load(Ordering::SeqCst) == generation {
+                    tracing::error!("DSH 子进程启动失败: {msg}");
+                    let _ = proxy.send_event(UserEvent::DshChildFailed(msg));
+                }
+            }
+        }
+    });
+}
+
+/// 停止 DSH 子进程（若有），并让在途的启动任务失效（代际 +1）。
+/// 回收在后台异步进行，不阻塞事件循环（避免 taskkill 卡住界面）。
+fn stop_dsh_child(
+    rt: &tokio::runtime::Runtime,
+    slot: &Arc<Mutex<Option<tokio::process::Child>>>,
+    gen: &Arc<AtomicU64>,
+) {
+    gen.fetch_add(1, Ordering::SeqCst);
+    let child = slot.lock().unwrap().take();
+    if let Some(mut c) = child {
+        rt.spawn(async move {
+            child_dsh::kill(&mut c).await;
+        });
+    }
+}
+
+/// 桌宠退出时同步回收 DSH 子进程（进程即将结束，阻塞可接受，确保子进程被回收）。
+fn stop_dsh_child_on_exit(
+    rt: &tokio::runtime::Runtime,
+    slot: &Arc<Mutex<Option<tokio::process::Child>>>,
+    gen: &Arc<AtomicU64>,
+) {
+    gen.fetch_add(1, Ordering::SeqCst);
+    let child = slot.lock().unwrap().take();
+    if let Some(mut c) = child {
+        rt.block_on(child_dsh::kill(&mut c));
+    }
+}
+
+/// 快速探测默认端口是否已有 DSH 服务（任何 <500 的 HTTP 响应都视为已占用）。
+fn dsh_server_running(rt: &tokio::runtime::Runtime, http: &reqwest::Client) -> bool {
+    let url = format!("{}/", Config::ENDPOINT_DEFAULT);
+    rt.block_on(async {
+        match tokio::time::timeout(Duration::from_millis(1500), http.get(&url).send()).await {
+            Ok(Ok(resp)) => {
+                tracing::info!("启动探测 {} → HTTP {}", url, resp.status());
+                resp.status().as_u16() < 500
+            }
+            Ok(Err(e)) => {
+                tracing::info!("启动探测 {} 失败: {e}", url);
+                false
+            }
+            Err(_) => {
+                tracing::info!("启动探测 {} 超时", url);
+                false
+            }
+        }
+    })
+}
+
+// 关闭「由桌宠启动 DSH」的确认已改为面板内确认框（renderer 绘制），
+// 不再使用原生 MessageBox：避免被置顶窗口挡住、显示延迟及风格不一致问题。
 
 /// 若 endpoint 输入框有焦点，提交编辑：校验 → 热切换 → 失焦。
 /// 无效输入恢复原值。无焦点时空操作。

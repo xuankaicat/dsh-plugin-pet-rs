@@ -20,6 +20,9 @@ pub struct Config {
     /// DSH 服务端地址（如 http://127.0.0.1:3080）
     #[serde(default = "Config::default_endpoint")]
     pub endpoint: String,
+    /// 是否由桌宠作为子进程启动 DSH（开启时设置里的地址只读）
+    #[serde(default)]
+    pub spawn_dsh: bool,
     /// 窗口位置（保存上次位置，None 时定位到右下角）
     #[serde(default)]
     pub window_x: Option<i32>,
@@ -96,6 +99,7 @@ impl Default for Config {
             bubble_visible: true,
             sound_on: true,
             endpoint: Self::ENDPOINT_DEFAULT.to_string(),
+            spawn_dsh: false,
             window_x: None,
             window_y: None,
         }
@@ -127,6 +131,13 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.endpoint, "http://192.168.1.100:3080");
+    }
+
+    #[test]
+    fn backward_compat_missing_spawn_dsh() {
+        let json = r#"{"scale":0.67,"endpoint":"http://127.0.0.1:3080"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.spawn_dsh);
     }
 
     #[test]

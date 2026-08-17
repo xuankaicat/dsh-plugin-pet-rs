@@ -18,7 +18,7 @@ DeepSeek Harness 桌面宠物鲸鱼，Rust 原生实现，三端支持（Windows
 - 💬 状态气泡（多会话聚合列表，可滚动，popIn 动画）
 - 🔔 状态提示音（attention / done，custom/ 可覆盖）
 - 🖼️ 透明置顶悬浮窗 + 系统托盘 + 拖拽 + 大小调节
-- ⚙️ 内嵌设置面板（右键鲸鱼打开）：声音开关、DSH 地址编辑、热切换
+- ⚙️ 内嵌设置面板（右键鲸鱼打开）：声音开关、「由桌宠启动 DSH」开关、地址编辑/只读、热切换、重启
 - 📦 `custom/sprites.json` 素材包 + `custom/*.m4a|mp3` 自定义音效
 - 🔒 对 DSH 零侵入（纯只读 HTTP/SSE）
 
@@ -28,7 +28,7 @@ DeepSeek Harness 桌面宠物鲸鱼，Rust 原生实现，三端支持（Windows
 
 | 操作 | 效果 |
 |------|------|
-| **单击鲸鱼** | 显示 / 隐藏状态气泡 |
+| **单击鲸鱼** | 立即显示 / 隐藏状态气泡（无延迟） |
 | **右键鲸鱼** | 打开 / 关闭内嵌设置面板 |
 | **按住鲸鱼拖拽** | 移动桌宠窗口位置 |
 | **滚轮（气泡上）** | 滚动会话列表 |
@@ -46,15 +46,19 @@ DeepSeek Harness 桌面宠物鲸鱼，Rust 原生实现，三端支持（Windows
 │ 设置                      ×   │
 │                               │
 │ 声音提醒              [ON/OFF] │
-│                               │
-│ DSH 地址                       │
+│ 由桌宠启动 DSH        [OFF/ON] │
+│ DSH 地址（只读）              │
 │ ┌───────────────────────────┐ │
-│ │ http://127.0.0.1:3080│    │ │
+│ │ http://127.0.0.1:3080 重启│ │
 │ └───────────────────────────┘ │
 └───────────────────────────────┘
 ```
 
 **声音提醒开关**：点击立即切换并持久化，与托盘菜单同步。
+
+**由桌宠启动 DSH**：开启后桌宠会自动拉起 DSH Web 作为子进程并自动切换连接，无需手动填地址。启动方式自动按顺序尝试：`dsh`（PATH 中已安装）→ `cmd /C dsh`（Windows shim）→ `npx --yes @deepseek-ai/dsh`（npm on-demand，即日常的 `npx @deepseek-ai/dsh web` 用法）；均使用 `--port 0` 由系统分配空闲端口（后台静默启动，不弹 CLI 窗口）。若全部失败会给出安装提示（`npm install -g @deepseek-ai/dsh`）。此时「DSH 地址」为只读显示，右侧「重启」按钮可重启该子进程（重启后自动重连新地址）。关闭该开关时会弹出确认警告（Windows）：将终止当前由桌宠启动的 DSH 进程；确认后停止子进程并恢复手动地址输入。桌宠退出（含托盘退出）时会一并回收子进程。
+
+> **启动自动检测**：若桌宠启动时（且配置为子进程模式）检测到默认端口 `http://127.0.0.1:3080` 已有 DSH 服务，会自动关闭子进程模式并直接连接现有实例（配置同步保存，下次不再尝试拉起）。
 
 **DSH 地址输入框**：
 
@@ -95,6 +99,7 @@ DeepSeek Harness 桌面宠物鲸鱼，Rust 原生实现，三端支持（Windows
 
 - 拖拽鲸鱼可移动窗口，位置自动保存。
 - 下次启动恢复上次位置；首次启动定位到屏幕右下角。
+- 启动时会校验窗口是否在可见显示器内：若位置在屏幕外（如显示器变更/多屏拔插导致），自动移回主显示器右下角，保证桌宠一定显示。
 
 ## 构建
 
@@ -135,9 +140,9 @@ cargo run --release -- --shot .shots
 
 | 平台 | 路径 |
 |------|------|
-| Windows | `%APPDATA%\dsh\pet\config.json` |
-| macOS | `~/Library/Application Support/dsh/pet/config.json` |
-| Linux | `~/.config/dsh/pet/config.json` |
+| Windows | `%APPDATA%\dsh\pet\config\config.json` |
+| macOS | `~/Library/Application Support/com.dsh.pet/config/config.json` |
+| Linux | `~/.config/pet/config/config.json` |
 
 ```json
 {
@@ -145,12 +150,13 @@ cargo run --release -- --shot .shots
   "bubble_visible": true,
   "sound_on": true,
   "endpoint": "http://127.0.0.1:3080",
+  "spawn_dsh": false,
   "window_x": 2268,
   "window_y": 1084
 }
 ```
 
-> 字段均可省略，缺省时使用默认值。旧版配置文件（无 `endpoint` 字段）自动兼容。
+> 字段均可省略，缺省时使用默认值。旧版配置文件（无 `endpoint` / `spawn_dsh` 字段）自动兼容。
 
 ## 自定义素材
 

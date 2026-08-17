@@ -93,3 +93,5 @@ fn find_system_font(_name: &str) -> Option<PathBuf> {
 pub fn cursor_screen_position() -> Option<(i32, i32)> {
     None
 }
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub fn ensure_window_on_screen(_window: &winit::window::Window) {}

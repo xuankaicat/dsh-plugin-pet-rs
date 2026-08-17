@@ -25,7 +25,7 @@ const _CANVAS_FULL_H: f32 = 174.0;
 /// 气泡尺寸（styles.css #bubble）
 const BUBBLE_W: f32 = 252.0;
 const BUBBLE_RADIUS: f32 = 14.0;
-const SETTINGS_H: f32 = 132.0;
+const SETTINGS_H: f32 = 136.0;
 /// 气泡背景色 rgba(14,26,78,0.92) ≈ alpha 235
 const BUBBLE_BG: [u8; 4] = [14, 26, 78, 235];
 /// 气泡与鲸鱼间距
@@ -66,6 +66,13 @@ pub enum SettingsHit {
     ToggleSound,
     Close,
     EndpointInput,
+    /// 「由桌宠启动 DSH」开关
+    SpawnDsh,
+    /// 重启桌宠托管的 DSH 子进程
+    RestartDsh,
+    /// 确认终止当前由桌宠启动的 DSH 进程（面板内确认框）
+    ConfirmStopDshYes,
+    ConfirmStopDshNo,
 }
 
 pub struct Renderer {
@@ -80,6 +87,8 @@ pub struct Renderer {
     bubble_visible: bool,
     bubble_anim: BubbleAnim,
     settings_visible: bool,
+    /// 是否由桌宠启动 DSH 子进程（开启时设置里的地址输入框只读）
+    spawn_dsh: bool,
     sound_on: bool,
     endpoint_text: String,
     endpoint_cursor: usize,
@@ -94,6 +103,12 @@ pub struct Renderer {
     settings_toggle_rect: Option<HitRect>,
     settings_close_rect: Option<HitRect>,
     settings_endpoint_rect: Option<HitRect>,
+    settings_spawn_rect: Option<HitRect>,
+    settings_restart_rect: Option<HitRect>,
+    /// 面板内确认框：是否等待确认终止 DSH 子进程
+    confirm_stop_dsh: bool,
+    confirm_yes_rect: Option<HitRect>,
+    confirm_no_rect: Option<HitRect>,
 }
 
 impl Renderer {
@@ -110,6 +125,7 @@ impl Renderer {
             bubble_visible: true,
             bubble_anim: BubbleAnim::Idle,
             settings_visible: false,
+            spawn_dsh: false,
             sound_on: true,
             endpoint_text: String::new(),
             endpoint_cursor: 0,
@@ -124,6 +140,11 @@ impl Renderer {
             settings_toggle_rect: None,
             settings_close_rect: None,
             settings_endpoint_rect: None,
+            settings_spawn_rect: None,
+            settings_restart_rect: None,
+            confirm_stop_dsh: false,
+            confirm_yes_rect: None,
+            confirm_no_rect: None,
         }
     }
 
@@ -183,6 +204,10 @@ impl Renderer {
             self.settings_toggle_rect = None;
             self.settings_close_rect = None;
             self.settings_endpoint_rect = None;
+            self.settings_spawn_rect = None;
+            self.settings_restart_rect = None;
+            self.confirm_yes_rect = None;
+            self.confirm_no_rect = None;
             self.draw_settings(bubble_y, time_ms);
         } else if self.bubble_visible
             || matches!(self.bubble_anim, BubbleAnim::Disappearing { .. })
@@ -198,12 +223,20 @@ impl Renderer {
             self.settings_toggle_rect = None;
             self.settings_close_rect = None;
             self.settings_endpoint_rect = None;
+            self.settings_spawn_rect = None;
+            self.settings_restart_rect = None;
+            self.confirm_yes_rect = None;
+            self.confirm_no_rect = None;
             self.draw_bubble(snapshot, anim_y, bubble_alpha, time_ms);
         } else {
             self.bubble_rect = None;
             self.settings_toggle_rect = None;
             self.settings_close_rect = None;
             self.settings_endpoint_rect = None;
+            self.settings_spawn_rect = None;
+            self.settings_restart_rect = None;
+            self.confirm_yes_rect = None;
+            self.confirm_no_rect = None;
         }
         self.draw_whale(snapshot, whale_y, time_ms);
 
@@ -484,6 +517,89 @@ impl Renderer {
         }
     }
 
+    /// 绘制面板内确认框：警告将终止由桌宠启动的 DSH 进程。
+    fn draw_confirm_stop(&mut self, y: f32, scale: f32) {
+        let w = BUBBLE_W * scale;
+        let x = (self.pixmap.width() as f32 - w) / 2.0;
+
+        // 警告文字（两行，居中）
+        let line1 = "关闭「由桌宠启动 DSH」将终止";
+        let line2 = "当前由桌宠启动的 DSH 进程，确定？";
+        let size = 13.0 * scale;
+        let line1_w = self.measure_text_width(line1, size);
+        let line2_w = self.measure_text_width(line2, size);
+        self.draw_text(
+            line1,
+            x + (w - line1_w) / 2.0,
+            y + 44.0 * scale,
+            size,
+            Color::from_rgba8(255, 255, 255, 235),
+            w - 20.0 * scale,
+            1.0,
+        );
+        self.draw_text(
+            line2,
+            x + (w - line2_w) / 2.0,
+            y + 64.0 * scale,
+            size,
+            Color::from_rgba8(255, 255, 255, 235),
+            w - 20.0 * scale,
+            1.0,
+        );
+
+        // 按钮：确定 / 取消（居中）
+        let btn_w = 64.0 * scale;
+        let btn_h = 26.0 * scale;
+        let gap = 16.0 * scale;
+        let total = btn_w * 2.0 + gap;
+        let start_x = (self.pixmap.width() as f32 - total) / 2.0;
+        let btn_y = y + SETTINGS_H * scale - btn_h - 12.0 * scale;
+
+        let yes = HitRect {
+            x: start_x,
+            y: btn_y,
+            w: btn_w,
+            h: btn_h,
+        };
+        self.fill_rounded_rect(yes, 6.0 * scale, Color::from_rgba8(92, 160, 255, 235));
+        self.draw_text(
+            "确定",
+            yes.x + (yes.w - 26.0 * scale) / 2.0,
+            yes.y + 6.0 * scale,
+            13.0 * scale,
+            Color::WHITE,
+            yes.w,
+            1.0,
+        );
+
+        let no = HitRect {
+            x: start_x + btn_w + gap,
+            y: btn_y,
+            w: btn_w,
+            h: btn_h,
+        };
+        self.fill_rounded_rect(no, 6.0 * scale, Color::from_rgba8(91, 104, 150, 235));
+        self.draw_text(
+            "取消",
+            no.x + (no.w - 26.0 * scale) / 2.0,
+            no.y + 6.0 * scale,
+            13.0 * scale,
+            Color::from_rgba8(255, 255, 255, 235),
+            no.w,
+            1.0,
+        );
+
+        self.confirm_yes_rect = Some(yes);
+        self.confirm_no_rect = Some(no);
+        // 确认框模式下 × 仍可关闭设置面板
+        self.settings_close_rect = Some(HitRect {
+            x: x + w - 42.0 * scale,
+            y,
+            w: 42.0 * scale,
+            h: 38.0 * scale,
+        });
+    }
+
     fn draw_settings(&mut self, y: f32, time_ms: u64) {
         let scale = self.dpi_scale;
         let w = BUBBLE_W * scale;
@@ -511,77 +627,96 @@ impl Renderer {
             20.0 * scale,
             1.0,
         );
-        // "声音提醒" 标签
+
+        // ---- 面板内确认框：关闭「由桌宠启动 DSH」前确认 ----
+        if self.confirm_stop_dsh {
+            self.draw_confirm_stop(y, scale);
+            self.settings_toggle_rect = None;
+            self.settings_spawn_rect = None;
+            self.settings_endpoint_rect = None;
+            self.settings_restart_rect = None;
+            return;
+        }
+
+        // ---- 声音提醒 ----
         self.draw_text(
             "声音提醒",
             x + 14.0 * scale,
-            y + 48.0 * scale,
+            y + 42.0 * scale,
             13.0 * scale,
             Color::from_rgba8(255, 255, 255, 230),
             130.0 * scale,
             1.0,
         );
-
-        // 声音开关 toggle
-        let toggle = HitRect {
+        let sound_toggle = HitRect {
             x: x + w - 58.0 * scale,
-            y: y + 46.0 * scale,
+            y: y + 40.0 * scale,
             w: 44.0 * scale,
             h: 24.0 * scale,
         };
-        let toggle_color = if self.sound_on {
-            Color::from_rgba8(92, 215, 170, 255)
-        } else {
-            Color::from_rgba8(91, 104, 150, 255)
-        };
-        self.fill_rounded_rect(toggle, 12.0 * scale, toggle_color);
-        let knob_x = if self.sound_on {
-            toggle.x + 32.0 * scale
-        } else {
-            toggle.x + 12.0 * scale
-        };
-        let mut knob = PathBuilder::new();
-        knob.push_circle(knob_x, toggle.y + 12.0 * scale, 8.0 * scale);
-        if let Some(path) = knob.finish() {
-            let mut paint = Paint::default();
-            paint.set_color(Color::WHITE);
-            paint.anti_alias = true;
-            self.pixmap.fill_path(
-                &path,
-                &paint,
-                FillRule::Winding,
-                Transform::identity(),
-                None,
-            );
-        }
+        self.draw_toggle(sound_toggle, self.sound_on);
 
-        // "DSH 地址" 标签
+        // ---- 由桌宠启动 DSH ----
         self.draw_text(
-            "DSH 地址",
+            "由桌宠启动 DSH",
             x + 14.0 * scale,
-            y + 74.0 * scale,
+            y + 66.0 * scale,
+            13.0 * scale,
+            Color::from_rgba8(255, 255, 255, 230),
+            130.0 * scale,
+            1.0,
+        );
+        let spawn_toggle = HitRect {
+            x: x + w - 58.0 * scale,
+            y: y + 64.0 * scale,
+            w: 44.0 * scale,
+            h: 24.0 * scale,
+        };
+        self.draw_toggle(spawn_toggle, self.spawn_dsh);
+
+        // ---- DSH 地址（spawn 模式下只读）----
+        let addr_label = if self.spawn_dsh {
+            "DSH 地址（只读）"
+        } else {
+            "DSH 地址"
+        };
+        self.draw_text(
+            addr_label,
+            x + 14.0 * scale,
+            y + 92.0 * scale,
             13.0 * scale,
             Color::from_rgba8(255, 255, 255, 230),
             130.0 * scale,
             1.0,
         );
 
-        // endpoint 输入框
+        // endpoint 输入框（spawn_dsh 时只读展示，不可编辑；右侧留出重启按钮）
+        let restart_rect = HitRect {
+            x: x + w - 62.0 * scale,
+            y: y + 108.0 * scale,
+            w: 58.0 * scale,
+            h: 24.0 * scale,
+        };
         let input_rect = HitRect {
             x: x + 10.0 * scale,
-            y: y + 94.0 * scale,
-            w: w - 20.0 * scale,
-            h: 28.0 * scale,
+            y: y + 108.0 * scale,
+            w: if self.spawn_dsh {
+                w - 20.0 * scale - 62.0 * scale - 10.0 * scale
+            } else {
+                w - 20.0 * scale
+            },
+            h: 24.0 * scale,
         };
         // 输入框背景
-        let bg_color = if self.endpoint_focused {
+        let editable = !self.spawn_dsh && self.endpoint_focused;
+        let bg_color = if editable {
             Color::from_rgba8(30, 50, 110, 235)
         } else {
             Color::from_rgba8(22, 38, 90, 200)
         };
         self.fill_rounded_rect(input_rect, 6.0 * scale, bg_color);
         // 焦点边框
-        if self.endpoint_focused {
+        if editable {
             let border = HitRect {
                 x: input_rect.x,
                 y: input_rect.y,
@@ -601,90 +736,176 @@ impl Renderer {
 
         // endpoint 文本
         let text_x = input_rect.x + 8.0 * scale;
-        let text_y = input_rect.y + 8.0 * scale;
+        let text_y = input_rect.y + 5.0 * scale;
         let text_size = 13.0 * scale;
         let text_max_w = input_rect.w - 16.0 * scale;
 
-        let has_preedit = self.endpoint_preedit.is_some();
-        let is_empty = self.endpoint_text.is_empty() && !has_preedit;
-
-        if is_empty && !self.endpoint_focused {
+        if self.spawn_dsh {
+            // 只读模式：显示子进程 DSH 地址，不可编辑
+            let url = if self.endpoint_text.is_empty() {
+                "启动中…".to_string()
+            } else {
+                self.endpoint_text.clone()
+            };
             self.draw_text(
-                "点击输入…",
+                &url,
                 text_x,
                 text_y,
                 text_size,
-                Color::from_rgba8(255, 255, 255, 100),
+                Color::from_rgba8(255, 255, 255, 200),
                 text_max_w,
                 1.0,
             );
-        } else {
-            let text_color = Color::from_rgba8(255, 255, 255, 235);
-            // 已确认文本（clone 避免与 draw_text 的 &mut self 冲突）
-            let confirmed = self.endpoint_text.clone();
-            let preedit_info = self.endpoint_preedit.clone();
-            let selection = self.endpoint_selection;
-            let confirmed_w = self.measure_text_width(&confirmed, text_size);
-
-            // 选区高亮背景
-            if let Some((sel_start, sel_end)) = selection {
-                let chars: Vec<char> = confirmed.chars().collect();
-                let before: String = chars[..sel_start].iter().collect();
-                let selected: String = chars[sel_start..sel_end].iter().collect();
-                let sel_x = text_x + self.measure_text_width(&before, text_size).min(text_max_w);
-                let sel_w = self.measure_text_width(&selected, text_size);
-                let sel_rect = HitRect {
-                    x: sel_x,
-                    y: text_y,
-                    w: sel_w,
-                    h: text_size + 2.0 * scale,
-                };
-                self.fill_rounded_rect(sel_rect, 2.0 * scale, Color::from_rgba8(92, 160, 255, 120));
-            }
-
-            self.draw_text(
-                &confirmed, text_x, text_y, text_size, text_color, text_max_w, 1.0,
+            // 重启按钮
+            self.fill_rounded_rect(
+                restart_rect,
+                6.0 * scale,
+                Color::from_rgba8(52, 82, 168, 235),
             );
-            // preedit 文本（紧接在已确认文本后）
-            if let Some((preedit, _)) = &preedit_info {
-                let preedit_x = text_x + confirmed_w.min(text_max_w);
-                let remaining = (text_max_w - confirmed_w.min(text_max_w)).max(0.0);
+            self.draw_text(
+                "重启",
+                restart_rect.x + (restart_rect.w - 24.0 * scale) / 2.0,
+                restart_rect.y + 6.0 * scale,
+                12.0 * scale,
+                Color::from_rgba8(255, 255, 255, 235),
+                restart_rect.w,
+                1.0,
+            );
+        } else {
+            let has_preedit = self.endpoint_preedit.is_some();
+            let is_empty = self.endpoint_text.is_empty() && !has_preedit;
+
+            if is_empty && !self.endpoint_focused {
                 self.draw_text(
-                    preedit, preedit_x, text_y, text_size, text_color, remaining, 1.0,
+                    "点击输入…",
+                    text_x,
+                    text_y,
+                    text_size,
+                    Color::from_rgba8(255, 255, 255, 100),
+                    text_max_w,
+                    1.0,
                 );
-                // preedit 下划线
-                let preedit_w = self.measure_text_width(preedit, text_size).min(remaining);
-                let underline = HitRect {
-                    x: preedit_x,
-                    y: text_y + text_size + 1.0 * scale,
-                    w: preedit_w,
-                    h: 1.0 * scale,
-                };
-                self.fill_rounded_rect(underline, 0.0, Color::from_rgba8(150, 180, 255, 200));
+            } else {
+                let text_color = Color::from_rgba8(255, 255, 255, 235);
+                // 已确认文本（clone 避免与 draw_text 的 &mut self 冲突）
+                let confirmed = self.endpoint_text.clone();
+                let preedit_info = self.endpoint_preedit.clone();
+                let selection = self.endpoint_selection;
+                let confirmed_w = self.measure_text_width(&confirmed, text_size);
+
+                // 选区高亮背景
+                if let Some((sel_start, sel_end)) = selection {
+                    let chars: Vec<char> = confirmed.chars().collect();
+                    let before: String = chars[..sel_start].iter().collect();
+                    let selected: String = chars[sel_start..sel_end].iter().collect();
+                    let sel_x =
+                        text_x + self.measure_text_width(&before, text_size).min(text_max_w);
+                    let sel_w = self.measure_text_width(&selected, text_size);
+                    let sel_rect = HitRect {
+                        x: sel_x,
+                        y: text_y,
+                        w: sel_w,
+                        h: text_size + 2.0 * scale,
+                    };
+                    self.fill_rounded_rect(
+                        sel_rect,
+                        2.0 * scale,
+                        Color::from_rgba8(92, 160, 255, 120),
+                    );
+                }
+
+                self.draw_text(
+                    &confirmed, text_x, text_y, text_size, text_color, text_max_w, 1.0,
+                );
+                // preedit 文本（紧接在已确认文本后）
+                if let Some((preedit, _)) = &preedit_info {
+                    let preedit_x = text_x + confirmed_w.min(text_max_w);
+                    let remaining = (text_max_w - confirmed_w.min(text_max_w)).max(0.0);
+                    self.draw_text(
+                        preedit, preedit_x, text_y, text_size, text_color, remaining, 1.0,
+                    );
+                    // preedit 下划线
+                    let preedit_w = self.measure_text_width(preedit, text_size).min(remaining);
+                    let underline = HitRect {
+                        x: preedit_x,
+                        y: text_y + text_size + 1.0 * scale,
+                        w: preedit_w,
+                        h: 1.0 * scale,
+                    };
+                    self.fill_rounded_rect(
+                        underline,
+                        0.0,
+                        Color::from_rgba8(150, 180, 255, 200),
+                    );
+                }
+            }
+
+            // 光标（焦点时 500ms 闪烁）
+            if self.endpoint_focused && (time_ms / 500).is_multiple_of(2) {
+                if let Some(cursor_x) = self.endpoint_cursor_x(text_x, text_size, text_max_w) {
+                    let cursor_rect = HitRect {
+                        x: cursor_x.round(),
+                        y: input_rect.y + 4.0 * scale,
+                        w: 1.0 * scale,
+                        h: 16.0 * scale,
+                    };
+                    self.fill_rounded_rect(
+                        cursor_rect,
+                        0.0,
+                        Color::from_rgba8(255, 255, 255, 220),
+                    );
+                }
             }
         }
 
-        // 光标（焦点时 500ms 闪烁）
-        if self.endpoint_focused && (time_ms / 500).is_multiple_of(2) {
-            if let Some(cursor_x) = self.endpoint_cursor_x(text_x, text_size, text_max_w) {
-                let cursor_rect = HitRect {
-                    x: cursor_x.round(),
-                    y: input_rect.y + 6.0 * scale,
-                    w: 1.0 * scale,
-                    h: 16.0 * scale,
-                };
-                self.fill_rounded_rect(cursor_rect, 0.0, Color::from_rgba8(255, 255, 255, 220));
-            }
-        }
-
-        self.settings_toggle_rect = Some(toggle);
+        self.settings_toggle_rect = Some(sound_toggle);
+        self.settings_spawn_rect = Some(spawn_toggle);
         self.settings_close_rect = Some(HitRect {
             x: x + w - 42.0 * scale,
             y,
             w: 42.0 * scale,
             h: 38.0 * scale,
         });
-        self.settings_endpoint_rect = Some(input_rect);
+        self.settings_endpoint_rect = if self.spawn_dsh {
+            None
+        } else {
+            Some(input_rect)
+        };
+        self.settings_restart_rect = if self.spawn_dsh {
+            Some(restart_rect)
+        } else {
+            None
+        };
+    }
+
+    /// 绘制开/关拨动开关
+    fn draw_toggle(&mut self, rect: HitRect, on: bool) {
+        let scale = self.dpi_scale;
+        let color = if on {
+            Color::from_rgba8(92, 215, 170, 255)
+        } else {
+            Color::from_rgba8(91, 104, 150, 255)
+        };
+        self.fill_rounded_rect(rect, 12.0 * scale, color);
+        let knob_x = if on {
+            rect.x + 32.0 * scale
+        } else {
+            rect.x + 12.0 * scale
+        };
+        let mut knob = PathBuilder::new();
+        knob.push_circle(knob_x, rect.y + 12.0 * scale, 8.0 * scale);
+        if let Some(path) = knob.finish() {
+            let mut paint = Paint::default();
+            paint.set_color(Color::WHITE);
+            paint.anti_alias = true;
+            self.pixmap.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
     }
 
     fn draw_card_background(&mut self, x: f32, y: f32, w: f32, h: f32, alpha: f32) {
@@ -895,6 +1116,19 @@ impl Renderer {
 
     pub fn set_settings_visible(&mut self, visible: bool) {
         self.settings_visible = visible;
+        if !visible {
+            self.confirm_stop_dsh = false;
+        }
+    }
+
+    /// 切换面板内「终止 DSH 子进程」确认框。
+    pub fn set_confirm_stop_dsh(&mut self, pending: bool) {
+        self.confirm_stop_dsh = pending;
+        if pending {
+            self.endpoint_focused = false;
+            self.endpoint_preedit = None;
+            self.endpoint_selection = None;
+        }
     }
 
     pub fn settings_visible(&self) -> bool {
@@ -903,6 +1137,16 @@ impl Renderer {
 
     pub fn set_sound_on(&mut self, sound_on: bool) {
         self.sound_on = sound_on;
+    }
+
+    /// 设置是否由桌宠启动 DSH 子进程（地址输入框随之切换只读）。
+    pub fn set_spawn_dsh(&mut self, spawn_dsh: bool) {
+        self.spawn_dsh = spawn_dsh;
+        if spawn_dsh {
+            self.endpoint_focused = false;
+            self.endpoint_preedit = None;
+            self.endpoint_selection = None;
+        }
     }
 
     pub fn set_endpoint_text(&mut self, text: String) {
@@ -1144,6 +1388,26 @@ impl Renderer {
             .is_some_and(|rect| rect.contains(x, y))
         {
             SettingsHit::Close
+        } else if self
+            .confirm_yes_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            SettingsHit::ConfirmStopDshYes
+        } else if self
+            .confirm_no_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            SettingsHit::ConfirmStopDshNo
+        } else if self
+            .settings_restart_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            SettingsHit::RestartDsh
+        } else if self
+            .settings_spawn_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            SettingsHit::SpawnDsh
         } else if self
             .settings_endpoint_rect
             .is_some_and(|rect| rect.contains(x, y))
