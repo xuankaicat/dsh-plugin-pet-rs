@@ -49,9 +49,7 @@ enum UserEvent {
 
 /// 透明区域点击穿透的轮询间隔（毫秒）
 const CLICK_THROUGH_POLL_MS: u64 = 200;
-/// 动画帧间隔（毫秒）：鲸鱼/气泡/设置面板的持续重绘按此节流，避免忙循环吃满 CPU
-const ANIM_FRAME_MS: u64 = 33;
-
+// 动画帧间隔（毫秒）：30fps=33ms，60fps=16ms，由设置里的动画帧率决定
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -160,6 +158,7 @@ fn main() -> anyhow::Result<()> {
     renderer.set_bubble_visible(config.bubble_visible);
     renderer.set_sound_on(config.sound_on);
     renderer.set_spawn_dsh(config.spawn_dsh);
+    renderer.set_anim_fps(config.anim_fps);
     let mut input = InputState::new();
     let audio = AudioPlayer::new();
 
@@ -411,6 +410,18 @@ fn main() -> anyhow::Result<()> {
                                     SettingsHit::ConfirmStopDshNo => {
                                         // 取消：保持开启
                                         renderer.set_confirm_stop_dsh(false);
+                                        window.request_redraw();
+                                    }
+                                    SettingsHit::FrameRate30 => {
+                                        config.anim_fps = 30;
+                                        renderer.set_anim_fps(30);
+                                        config.save();
+                                        window.request_redraw();
+                                    }
+                                    SettingsHit::FrameRate60 => {
+                                        config.anim_fps = 60;
+                                        renderer.set_anim_fps(60);
+                                        config.save();
                                         window.request_redraw();
                                     }
                                     SettingsHit::RestartDsh => {
@@ -699,9 +710,11 @@ fn main() -> anyhow::Result<()> {
                     || renderer.settings_visible()
                     || Renderer::is_animating(last_snapshot.mode);
                 if animating {
+                    // 帧间隔按设置：60fps=16ms，30fps=33ms
+                    let frame_ms = if config.anim_fps >= 60 { 16u64 } else { 33u64 };
                     let next = next_frame.unwrap_or(now);
                     if now >= next {
-                        next_frame = Some(now + Duration::from_millis(ANIM_FRAME_MS));
+                        next_frame = Some(now + Duration::from_millis(frame_ms));
                         elwt.set_control_flow(ControlFlow::WaitUntil(next_frame.unwrap()));
                         window.request_redraw();
                     } else {

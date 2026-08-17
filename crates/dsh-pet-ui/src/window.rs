@@ -17,8 +17,9 @@ use winit::window::{Window, WindowLevel};
 pub fn create_window<T>(el: &EventLoop<T>, config: &Config) -> anyhow::Result<Window> {
     let mut builder = Window::default_attributes()
         .with_title("DSH 桌宠")
-        // Electron 原版窗口固定 280×340；pet_scale 只缩放鲸鱼舞台，不缩放窗口/气泡。
-        .with_inner_size(LogicalSize::new(280u32, 340u32))
+        // 窗口 280×372：加高以容纳设置面板三行开关（声音/帧率/由桌宠启动 DSH）；
+        // pet_scale 只缩放鲸鱼舞台，不缩放窗口/气泡。
+        .with_inner_size(LogicalSize::new(280u32, 372u32))
         .with_transparent(true)
         .with_decorations(false)
         .with_resizable(false)

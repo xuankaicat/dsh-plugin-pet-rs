@@ -25,7 +25,7 @@ const _CANVAS_FULL_H: f32 = 174.0;
 /// 气泡尺寸（styles.css #bubble）
 const BUBBLE_W: f32 = 252.0;
 const BUBBLE_RADIUS: f32 = 14.0;
-const SETTINGS_H: f32 = 136.0;
+const SETTINGS_H: f32 = 162.0;
 /// 气泡背景色 rgba(14,26,78,0.92) ≈ alpha 235
 const BUBBLE_BG: [u8; 4] = [14, 26, 78, 235];
 /// 气泡与鲸鱼间距
@@ -78,6 +78,9 @@ pub enum SettingsHit {
     /// 确认终止当前由桌宠启动的 DSH 进程（面板内确认框）
     ConfirmStopDshYes,
     ConfirmStopDshNo,
+    /// 动画帧率选择（30 / 60 fps）
+    FrameRate30,
+    FrameRate60,
 }
 
 /// 面板内右键菜单动作（托盘创建失败时的兜底菜单）。
@@ -132,12 +135,16 @@ pub struct Renderer {
     menu_visible: bool,
     menu_origin: (f32, f32),
     menu_item_rects: Vec<HitRect>,
+    /// 动画帧率（30 或 60 fps）
+    anim_fps: u32,
+    fps30_rect: Option<HitRect>,
+    fps60_rect: Option<HitRect>,
 }
 
 impl Renderer {
     pub fn new(assets: Arc<SpritePack>, font: FontArc, pet_scale: f32, dpi_scale: f32) -> Self {
         let w = ((280.0 * dpi_scale).round() as u32).max(1);
-        let h = ((340.0 * dpi_scale).round() as u32).max(1);
+        let h = ((372.0 * dpi_scale).round() as u32).max(1);
         Self {
             pixmap: Pixmap::new(w, h).expect("无法创建 pixmap"),
             assets,
@@ -171,6 +178,9 @@ impl Renderer {
             menu_visible: false,
             menu_origin: (0.0, 0.0),
             menu_item_rects: Vec::new(),
+            anim_fps: 30,
+            fps30_rect: None,
+            fps60_rect: None,
         }
     }
 
@@ -234,6 +244,8 @@ impl Renderer {
             self.settings_restart_rect = None;
             self.confirm_yes_rect = None;
             self.confirm_no_rect = None;
+            self.fps30_rect = None;
+            self.fps60_rect = None;
             self.draw_settings(bubble_y, time_ms);
         } else if self.bubble_visible
             || matches!(self.bubble_anim, BubbleAnim::Disappearing { .. })
@@ -253,6 +265,8 @@ impl Renderer {
             self.settings_restart_rect = None;
             self.confirm_yes_rect = None;
             self.confirm_no_rect = None;
+            self.fps30_rect = None;
+            self.fps60_rect = None;
             self.draw_bubble(snapshot, anim_y, bubble_alpha, time_ms);
         } else {
             self.bubble_rect = None;
@@ -263,6 +277,8 @@ impl Renderer {
             self.settings_restart_rect = None;
             self.confirm_yes_rect = None;
             self.confirm_no_rect = None;
+            self.fps30_rect = None;
+            self.fps60_rect = None;
         }
         self.draw_whale(snapshot, whale_y, time_ms);
 
@@ -621,7 +637,7 @@ impl Renderer {
         self.draw_text(
             line1,
             x + (w - line1_w) / 2.0,
-            y + 44.0 * scale,
+            y + 54.0 * scale,
             size,
             Color::from_rgba8(255, 255, 255, 235),
             w - 20.0 * scale,
@@ -630,7 +646,7 @@ impl Renderer {
         self.draw_text(
             line2,
             x + (w - line2_w) / 2.0,
-            y + 64.0 * scale,
+            y + 76.0 * scale,
             size,
             Color::from_rgba8(255, 255, 255, 235),
             w - 20.0 * scale,
@@ -686,7 +702,7 @@ impl Renderer {
             x: x + w - 42.0 * scale,
             y,
             w: 42.0 * scale,
-            h: 38.0 * scale,
+            h: 32.0 * scale,
         });
     }
 
@@ -746,11 +762,59 @@ impl Renderer {
         };
         self.draw_toggle(sound_toggle, self.sound_on);
 
+        // ---- 动画帧率（30 / 60 fps）----
+        self.draw_text(
+            "动画帧率",
+            x + 14.0 * scale,
+            y + 68.0 * scale,
+            13.0 * scale,
+            Color::from_rgba8(255, 255, 255, 230),
+            130.0 * scale,
+            1.0,
+        );
+        let fps_w = 40.0 * scale;
+        let fps_h = 24.0 * scale;
+        let fps_y = y + 66.0 * scale;
+        let fps30 = HitRect {
+            x: x + w - fps_w * 2.0 - 6.0 * scale,
+            y: fps_y,
+            w: fps_w,
+            h: fps_h,
+        };
+        let fps60 = HitRect {
+            x: x + w - fps_w,
+            y: fps_y,
+            w: fps_w,
+            h: fps_h,
+        };
+        for (rect, label, selected) in [
+            (fps30, "30fps", self.anim_fps == 30),
+            (fps60, "60fps", self.anim_fps == 60),
+        ] {
+            let color = if selected {
+                Color::from_rgba8(92, 160, 255, 235)
+            } else {
+                Color::from_rgba8(60, 72, 110, 200)
+            };
+            self.fill_rounded_rect(rect, 6.0 * scale, color);
+            self.draw_text(
+                label,
+                rect.x + (rect.w - 30.0 * scale) / 2.0,
+                rect.y + 6.0 * scale,
+                11.0 * scale,
+                Color::from_rgba8(255, 255, 255, 235),
+                rect.w,
+                1.0,
+            );
+        }
+        self.fps30_rect = Some(fps30);
+        self.fps60_rect = Some(fps60);
+
         // ---- 由桌宠启动 DSH ----
         self.draw_text(
             "由桌宠启动 DSH",
             x + 14.0 * scale,
-            y + 66.0 * scale,
+            y + 94.0 * scale,
             13.0 * scale,
             Color::from_rgba8(255, 255, 255, 230),
             130.0 * scale,
@@ -758,7 +822,7 @@ impl Renderer {
         );
         let spawn_toggle = HitRect {
             x: x + w - 58.0 * scale,
-            y: y + 64.0 * scale,
+            y: y + 92.0 * scale,
             w: 44.0 * scale,
             h: 24.0 * scale,
         };
@@ -773,7 +837,7 @@ impl Renderer {
         self.draw_text(
             addr_label,
             x + 14.0 * scale,
-            y + 92.0 * scale,
+            y + 118.0 * scale,
             13.0 * scale,
             Color::from_rgba8(255, 255, 255, 230),
             130.0 * scale,
@@ -783,19 +847,19 @@ impl Renderer {
         // endpoint 输入框（spawn_dsh 时只读展示，不可编辑；右侧留出重启按钮）
         let restart_rect = HitRect {
             x: x + w - 62.0 * scale,
-            y: y + 108.0 * scale,
+            y: y + 132.0 * scale,
             w: 58.0 * scale,
-            h: 24.0 * scale,
+            h: 26.0 * scale,
         };
         let input_rect = HitRect {
             x: x + 10.0 * scale,
-            y: y + 108.0 * scale,
+            y: y + 132.0 * scale,
             w: if self.spawn_dsh {
                 w - 20.0 * scale - 62.0 * scale - 10.0 * scale
             } else {
                 w - 20.0 * scale
             },
-            h: 24.0 * scale,
+            h: 26.0 * scale,
         };
         // 输入框背景
         let editable = !self.spawn_dsh && self.endpoint_focused;
@@ -826,7 +890,7 @@ impl Renderer {
 
         // endpoint 文本
         let text_x = input_rect.x + 8.0 * scale;
-        let text_y = input_rect.y + 5.0 * scale;
+        let text_y = input_rect.y + 6.0 * scale;
         let text_size = 13.0 * scale;
         let text_max_w = input_rect.w - 16.0 * scale;
 
@@ -935,7 +999,7 @@ impl Renderer {
                 if let Some(cursor_x) = self.endpoint_cursor_x(text_x, text_size, text_max_w) {
                     let cursor_rect = HitRect {
                         x: cursor_x.round(),
-                        y: input_rect.y + 4.0 * scale,
+                        y: input_rect.y + 5.0 * scale,
                         w: 1.0 * scale,
                         h: 16.0 * scale,
                     };
@@ -954,7 +1018,7 @@ impl Renderer {
             x: x + w - 42.0 * scale,
             y,
             w: 42.0 * scale,
-            h: 38.0 * scale,
+            h: 32.0 * scale,
         });
         self.settings_endpoint_rect = if self.spawn_dsh {
             None
@@ -983,7 +1047,7 @@ impl Renderer {
             rect.x + 12.0 * scale
         };
         let mut knob = PathBuilder::new();
-        knob.push_circle(knob_x, rect.y + 12.0 * scale, 8.0 * scale);
+        knob.push_circle(knob_x, rect.y + rect.h / 2.0, 8.0 * scale);
         if let Some(path) = knob.finish() {
             let mut paint = Paint::default();
             paint.set_color(Color::WHITE);
@@ -1284,6 +1348,11 @@ impl Renderer {
         self.sound_on = sound_on;
     }
 
+    /// 设置动画帧率（30 或 60）。
+    pub fn set_anim_fps(&mut self, fps: u32) {
+        self.anim_fps = if fps >= 60 { 60 } else { 30 };
+    }
+
     /// 设置是否由桌宠启动 DSH 子进程（地址输入框随之切换只读）。
     pub fn set_spawn_dsh(&mut self, spawn_dsh: bool) {
         self.spawn_dsh = spawn_dsh;
@@ -1543,6 +1612,16 @@ impl Renderer {
             .is_some_and(|rect| rect.contains(x, y))
         {
             SettingsHit::ConfirmStopDshNo
+        } else if self
+            .fps30_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            SettingsHit::FrameRate30
+        } else if self
+            .fps60_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            SettingsHit::FrameRate60
         } else if self
             .settings_restart_rect
             .is_some_and(|rect| rect.contains(x, y))

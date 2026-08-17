@@ -23,6 +23,9 @@ pub struct Config {
     /// 是否由桌宠作为子进程启动 DSH（开启时设置里的地址只读）
     #[serde(default)]
     pub spawn_dsh: bool,
+    /// 动画帧率（30 或 60 fps）
+    #[serde(default = "Config::default_anim_fps")]
+    pub anim_fps: u32,
     /// 窗口位置（保存上次位置，None 时定位到右下角）
     #[serde(default)]
     pub window_x: Option<i32>,
@@ -46,6 +49,9 @@ impl Config {
     }
     fn default_endpoint() -> String {
         Self::ENDPOINT_DEFAULT.to_string()
+    }
+    fn default_anim_fps() -> u32 {
+        30
     }
 
     /// 配置文件路径：平台 config_dir / dsh-pet / config.json
@@ -100,6 +106,7 @@ impl Default for Config {
             sound_on: true,
             endpoint: Self::ENDPOINT_DEFAULT.to_string(),
             spawn_dsh: false,
+            anim_fps: 30,
             window_x: None,
             window_y: None,
         }
