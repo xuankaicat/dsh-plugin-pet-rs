@@ -14,6 +14,9 @@ default = []
 # Enable to bundle m4a decoding (symphonia aac+isomp4 adds ~800KB)
 m4a = ["symphonia/aac", "symphonia/isomp4"]
 
+[build-dependencies]
+winres = "0.1"
+
 [dependencies]
 dsh-pet-core = { path = "../dsh-pet-core" }
 dsh-pet-ui = { path = "../dsh-pet-ui" }
