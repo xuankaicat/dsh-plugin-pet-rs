@@ -171,9 +171,22 @@ impl Renderer {
 
         // 气泡浮入/浮出动画：上浮出现（自下而上浮入并淡入）、下浮消失（向下沉出并淡出）
         let (bubble_offset, bubble_alpha) = self.bubble_anim_progress(bubble_h);
-        let show_bubble =
-            self.bubble_visible || matches!(self.bubble_anim, BubbleAnim::Disappearing { .. });
-        if show_bubble {
+        if self.settings_visible {
+            // 设置面板始终绘制（与气泡显隐无关），占据气泡区域
+            let bubble_w = BUBBLE_W * self.dpi_scale;
+            self.bubble_rect = Some(HitRect {
+                x: (self.pixmap.width() as f32 - bubble_w) / 2.0,
+                y: bubble_y,
+                w: bubble_w,
+                h: bubble_h + 9.0 * self.dpi_scale,
+            });
+            self.settings_toggle_rect = None;
+            self.settings_close_rect = None;
+            self.settings_endpoint_rect = None;
+            self.draw_settings(bubble_y, time_ms);
+        } else if self.bubble_visible
+            || matches!(self.bubble_anim, BubbleAnim::Disappearing { .. })
+        {
             let bubble_w = BUBBLE_W * self.dpi_scale;
             let anim_y = bubble_y + bubble_offset;
             self.bubble_rect = Some(HitRect {
@@ -182,14 +195,10 @@ impl Renderer {
                 w: bubble_w,
                 h: bubble_h + 9.0 * self.dpi_scale,
             });
-            if self.settings_visible {
-                self.draw_settings(bubble_y, time_ms);
-            } else {
-                self.settings_toggle_rect = None;
-                self.settings_close_rect = None;
-                self.settings_endpoint_rect = None;
-                self.draw_bubble(snapshot, anim_y, bubble_alpha, time_ms);
-            }
+            self.settings_toggle_rect = None;
+            self.settings_close_rect = None;
+            self.settings_endpoint_rect = None;
+            self.draw_bubble(snapshot, anim_y, bubble_alpha, time_ms);
         } else {
             self.bubble_rect = None;
             self.settings_toggle_rect = None;

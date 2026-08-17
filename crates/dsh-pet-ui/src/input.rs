@@ -2,7 +2,6 @@
 //!
 //! 对应 renderer.js L113-177 的拖拽 + 点击逻辑。
 
-use std::time::{Duration, Instant};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,66 +10,11 @@ pub enum ClickTarget {
     Bubble,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClickDecision {
-    Pending,
-    DoubleClick,
-}
-
-pub struct ClickTracker {
-    pending_since: Option<Instant>,
-    interval: Duration,
-}
-
-impl Default for ClickTracker {
-    fn default() -> Self {
-        Self::new(Duration::from_millis(250))
-    }
-}
-
-impl ClickTracker {
-    pub fn new(interval: Duration) -> Self {
-        Self {
-            pending_since: None,
-            interval,
-        }
-    }
-
-    pub fn register(&mut self, now: Instant) -> ClickDecision {
-        if self
-            .pending_since
-            .is_some_and(|first| now.duration_since(first) <= self.interval)
-        {
-            self.pending_since = None;
-            ClickDecision::DoubleClick
-        } else {
-            self.pending_since = Some(now);
-            ClickDecision::Pending
-        }
-    }
-
-    pub fn poll_single_click(&mut self, now: Instant) -> bool {
-        if self
-            .pending_since
-            .is_some_and(|first| now.duration_since(first) >= self.interval)
-        {
-            self.pending_since = None;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn next_deadline(&self) -> Option<Instant> {
-        self.pending_since.map(|started| started + self.interval)
-    }
-}
-
 /// 输入事件产生的动作
 #[derive(Debug, Clone)]
 pub enum InputAction {
     None,
-    /// 单击鲸鱼/气泡 → 打开 GUI
+    /// 单击鲸鱼 → 切换气泡显示/隐藏；单击气泡 → 打开 GUI
     Click(ClickTarget),
     /// 右键 → 上下文菜单
     ContextMenu,
@@ -305,29 +249,3 @@ pub fn drag_delta(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn single_click_fires_after_interval() {
-        let start = Instant::now();
-        let mut tracker = ClickTracker::new(Duration::from_millis(250));
-        assert_eq!(tracker.register(start), ClickDecision::Pending);
-        assert!(!tracker.poll_single_click(start + Duration::from_millis(249)));
-        assert!(tracker.poll_single_click(start + Duration::from_millis(250)));
-        assert!(!tracker.poll_single_click(start + Duration::from_millis(500)));
-    }
-
-    #[test]
-    fn double_click_cancels_single_click() {
-        let start = Instant::now();
-        let mut tracker = ClickTracker::new(Duration::from_millis(250));
-        assert_eq!(tracker.register(start), ClickDecision::Pending);
-        assert_eq!(
-            tracker.register(start + Duration::from_millis(120)),
-            ClickDecision::DoubleClick
-        );
-        assert!(!tracker.poll_single_click(start + Duration::from_millis(400)));
-    }
-}

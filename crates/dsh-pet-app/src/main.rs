@@ -21,8 +21,7 @@ use std::time::{Duration, Instant};
 
 use dsh_pet_core::{Config, Mode, PetState, Snapshot, StateEvent};
 use dsh_pet_ui::{
-    create_window, ClickDecision, ClickTarget, ClickTracker, InputAction, InputState, Renderer,
-    SettingsHit,
+    create_window, ClickTarget, InputAction, InputState, Renderer, SettingsHit,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -148,7 +147,6 @@ fn main() -> anyhow::Result<()> {
     renderer.set_bubble_visible(config.bubble_visible);
     renderer.set_sound_on(config.sound_on);
     let mut input = InputState::new();
-    let mut click_tracker = ClickTracker::default();
     let audio = AudioPlayer::new();
 
     // 平台初始化
@@ -243,7 +241,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     match action {
                         InputAction::Click(ClickTarget::Whale) => {
-                            // 点击鲸鱼时提交 endpoint 编辑
+                            // 单击鲸鱼：先提交 endpoint 编辑
                             commit_endpoint_if_focused(
                                 &mut renderer,
                                 &mut config,
@@ -256,15 +254,17 @@ fn main() -> anyhow::Result<()> {
                             if !renderer.endpoint_focused() {
                                 window.set_ime_allowed(false);
                             }
-                            let decision = click_tracker.register(Instant::now());
-                            if decision == ClickDecision::DoubleClick {
-                                // 打开设置前，若有未提交的 endpoint 编辑则丢弃
+                            if renderer.settings_visible() {
+                                // 设置面板打开时，单击鲸鱼 → 关闭面板（丢弃未提交编辑）
                                 renderer.set_endpoint_focused(false);
                                 window.set_ime_allowed(false);
                                 renderer.set_endpoint_text(dsh_url.clone());
-                                renderer.set_settings_visible(true);
-                                window.request_redraw();
+                                renderer.set_settings_visible(false);
+                            } else {
+                                // 否则切换气泡显示/隐藏（无延迟）
+                                toggle_bubble(&mut config, &mut renderer, tray_ui.as_ref());
                             }
+                            window.request_redraw();
                         }
                         InputAction::Click(ClickTarget::Bubble) => {
                             if renderer.settings_visible() {
@@ -331,7 +331,12 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         InputAction::ContextMenu => {
-                            // 右键菜单：v1 暂不弹出，用户通过托盘访问
+                            // 右键：切换设置面板开/关（丢弃未提交的 endpoint 编辑）
+                            renderer.set_endpoint_focused(false);
+                            window.set_ime_allowed(false);
+                            renderer.set_endpoint_text(dsh_url.clone());
+                            renderer.set_settings_visible(!renderer.settings_visible());
+                            window.request_redraw();
                         }
                         _ => {}
                     }
@@ -536,11 +541,6 @@ fn main() -> anyhow::Result<()> {
                     let _ = proxy.send_event(UserEvent::TrayAction(action));
                 }
                 let now = Instant::now();
-                if click_tracker.poll_single_click(now) {
-                    // 单击鲸鱼：切换气泡显示/隐藏（不再打开 DSH GUI）
-                    toggle_bubble(&mut config, &mut renderer, tray_ui.as_ref());
-                    window.request_redraw();
-                }
                 // 气泡浮入/浮出动画期间 60fps 持续重绘
                 let bubble_deadline = if renderer.bubble_animating() {
                     Some(now + Duration::from_millis(16))
@@ -553,13 +553,8 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     None
                 };
-                let click_deadline = click_tracker.next_deadline();
                 let needs_redraw = bubble_deadline.is_some() || settings_deadline.is_some();
-                let deadline = bubble_deadline
-                    .into_iter()
-                    .chain(settings_deadline)
-                    .chain(click_deadline)
-                    .min();
+                let deadline = bubble_deadline.into_iter().chain(settings_deadline).min();
                 match deadline {
                     Some(d) => {
                         elwt.set_control_flow(ControlFlow::WaitUntil(d));
