@@ -10,6 +10,8 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 #[derive(Debug, Clone)]
 pub enum TrayAction {
     OpenGui,
+    /// 打开内嵌设置面板
+    OpenSettings,
     ToggleBubble,
     ToggleSound,
     TestSound,
@@ -22,6 +24,7 @@ pub enum TrayAction {
 /// 托盘菜单项 ID（用于事件匹配）
 struct MenuIds {
     open_gui: MenuId,
+    open_settings: MenuId,
     toggle_bubble: MenuId,
     sound: MenuId,
     test_sound: MenuId,
@@ -64,6 +67,7 @@ pub fn create(sound_on: bool, bubble_visible: bool, scale: f32) -> Option<TrayUi
 
     let menu = Menu::new();
     let open_gui = MenuItem::new("打开 DSH GUI", true, None);
+    let open_settings = MenuItem::new("打开设置", true, None);
     let toggle_bubble = MenuItem::new(
         if bubble_visible {
             "隐藏气泡"
@@ -84,6 +88,7 @@ pub fn create(sound_on: bool, bubble_visible: bool, scale: f32) -> Option<TrayUi
     let quit = MenuItem::new("退出桌宠", true, None);
 
     let _ = menu.append(&open_gui);
+    let _ = menu.append(&open_settings);
     let _ = menu.append(&toggle_bubble);
     let _ = menu.append(&sound);
     let _ = menu.append(&test_sound);
@@ -100,6 +105,7 @@ pub fn create(sound_on: bool, bubble_visible: bool, scale: f32) -> Option<TrayUi
         let mut ids = MENU_IDS.lock().unwrap();
         *ids = Some(MenuIds {
             open_gui: open_gui.id().clone(),
+            open_settings: open_settings.id().clone(),
             toggle_bubble: toggle_bubble.id().clone(),
             sound: sound.id().clone(),
             test_sound: test_sound.id().clone(),
@@ -131,6 +137,8 @@ pub fn poll_action() -> Option<TrayAction> {
     let ids = ids.as_ref()?;
     let action = if event.id == ids.open_gui {
         TrayAction::OpenGui
+    } else if event.id == ids.open_settings {
+        TrayAction::OpenSettings
     } else if event.id == ids.toggle_bubble {
         TrayAction::ToggleBubble
     } else if event.id == ids.sound {

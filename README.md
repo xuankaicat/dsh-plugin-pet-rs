@@ -89,6 +89,7 @@ DeepSeek Harness 桌面宠物鲸鱼，Rust 原生实现，三端支持（Windows
 | 菜单项 | 效果 |
 |--------|------|
 | 打开 DSH GUI | 在浏览器打开 DSH |
+| 打开设置 | 打开内嵌设置面板 |
 | 隐藏/显示气泡 | 切换状态气泡可见性 |
 | 状态提示音 | 勾选框，切换声音并持久化 |
 | 测试提示音 | 播放 done 音效 |
@@ -209,7 +210,7 @@ crates/
 
 ### Linux GNOME 托盘
 
-GNOME 默认无系统托盘，需安装 [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) 扩展。托盘创建失败时，右键鲸鱼本体仍可访问菜单。
+GNOME 默认无系统托盘，需安装 [AppIndicator and KStatusNotifierItem Support](https://extensions.gnome.org/extension/615/appindicator-support/) 扩展。托盘创建失败时，**右键鲸鱼本体会在窗口内弹出菜单**（打开 DSH GUI / 打开设置 / 气泡 / 提示音 / 缩放 / 退出），功能与托盘菜单一致。
 
 ## 字体
 

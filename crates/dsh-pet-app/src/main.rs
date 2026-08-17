@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use dsh_pet_core::{Config, Mode, PetState, Snapshot, StateEvent};
 use dsh_pet_ui::{
-    create_window, ClickTarget, InputAction, InputState, Renderer, SettingsHit,
+    create_window, ClickTarget, ContextMenuAction, InputAction, InputState, Renderer, SettingsHit,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -270,7 +270,32 @@ fn main() -> anyhow::Result<()> {
                     if *state == winit::event::ElementState::Released {
                         input.clear_drag_origin();
                     }
-                    match action {
+                    // 面板内右键菜单可见时：左键优先命中菜单项，点击外部关闭菜单
+                    let menu_handled = if renderer.menu_visible()
+                        && *state == winit::event::ElementState::Released
+                    {
+                        let (x, y) = input.cursor_position();
+                        let menu_action = renderer.menu_action_at(x, y);
+                        renderer.set_menu_visible(false);
+                        if let Some(ma) = menu_action {
+                            handle_menu_action(
+                                ma,
+                                &mut config,
+                                &mut renderer,
+                                &audio,
+                                tray_ui.as_ref(),
+                                &dsh_url,
+                                &window,
+                                elwt,
+                            );
+                        }
+                        window.request_redraw();
+                        true
+                    } else {
+                        false
+                    };
+                    if !menu_handled {
+                        match action {
                         InputAction::Click(ClickTarget::Whale) => {
                             // 单击鲸鱼：先提交 endpoint 编辑
                             commit_endpoint_if_focused(
@@ -421,14 +446,23 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         InputAction::ContextMenu => {
-                            // 右键：切换设置面板开/关（丢弃未提交的 endpoint 编辑）
-                            renderer.set_endpoint_focused(false);
-                            window.set_ime_allowed(false);
-                            renderer.set_endpoint_text(dsh_url.clone());
-                            renderer.set_settings_visible(!renderer.settings_visible());
+                            // 右键：托盘创建失败（如 Linux GNOME 无扩展）时打开面板内菜单；
+                            // 否则切换设置面板开/关（丢弃未提交的 endpoint 编辑）
+                            if renderer.menu_visible() {
+                                renderer.set_menu_visible(false);
+                            } else if tray_ui.is_none() {
+                                let (x, y) = input.cursor_position();
+                                renderer.open_menu(x as f32, y as f32);
+                            } else {
+                                renderer.set_endpoint_focused(false);
+                                window.set_ime_allowed(false);
+                                renderer.set_endpoint_text(dsh_url.clone());
+                                renderer.set_settings_visible(!renderer.settings_visible());
+                            }
                             window.request_redraw();
                         }
-                        _ => {}
+                            _ => {}
+                        }
                     }
                     if *state == winit::event::ElementState::Released {
                         window.request_redraw();
@@ -450,13 +484,15 @@ fn main() -> anyhow::Result<()> {
                 }
                 WindowEvent::KeyboardInput { event, .. }
                     if event.state == winit::event::ElementState::Pressed
-                        && renderer.settings_visible() =>
+                        && (renderer.settings_visible() || renderer.menu_visible()) =>
                 {
                     let has_preedit = renderer.endpoint_preedit().is_some();
                     let ctrl = modifiers.control_key();
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
-                            if renderer.endpoint_focused() {
+                            if renderer.menu_visible() {
+                                renderer.set_menu_visible(false);
+                            } else if renderer.endpoint_focused() {
                                 renderer.set_endpoint_focused(false);
                                 window.set_ime_allowed(false);
                                 renderer.set_endpoint_text(dsh_url.clone());
@@ -711,6 +747,12 @@ fn handle_tray_action(
         TrayAction::OpenGui => {
             let _ = open::that(dsh_url);
         }
+        TrayAction::OpenSettings => {
+            renderer.set_endpoint_focused(false);
+            renderer.set_menu_visible(false);
+            renderer.set_endpoint_text(dsh_url.to_string());
+            renderer.set_settings_visible(true);
+        }
         TrayAction::ToggleBubble => {
             toggle_bubble(config, renderer, tray_ui);
         }
@@ -738,6 +780,43 @@ fn handle_tray_action(
             // 通过 elwt.exit() 正常退出，让 LoopExiting 回收 DSH 子进程并保存配置
             config.save();
             elwt.exit();
+        }
+    }
+}
+
+/// 处理面板内右键菜单动作（托盘创建失败时的兜底菜单）。
+#[allow(clippy::too_many_arguments)]
+fn handle_menu_action(
+    action: ContextMenuAction,
+    config: &mut Config,
+    renderer: &mut Renderer,
+    audio: &AudioPlayer,
+    tray_ui: Option<&tray::TrayUi>,
+    dsh_url: &str,
+    window: &winit::window::Window,
+    elwt: &winit::event_loop::ActiveEventLoop,
+) {
+    match action {
+        ContextMenuAction::OpenSettings => {
+            renderer.set_endpoint_focused(false);
+            window.set_ime_allowed(false);
+            renderer.set_endpoint_text(dsh_url.to_string());
+            renderer.set_settings_visible(true);
+        }
+        other => {
+            use tray::TrayAction;
+            let ta = match other {
+                ContextMenuAction::OpenGui => TrayAction::OpenGui,
+                ContextMenuAction::ToggleBubble => TrayAction::ToggleBubble,
+                ContextMenuAction::ToggleSound => TrayAction::ToggleSound,
+                ContextMenuAction::TestSound => TrayAction::TestSound,
+                ContextMenuAction::ScaleUp => TrayAction::ScaleUp,
+                ContextMenuAction::ScaleDown => TrayAction::ScaleDown,
+                ContextMenuAction::ScaleReset => TrayAction::ScaleReset,
+                ContextMenuAction::Quit => TrayAction::Quit,
+                ContextMenuAction::OpenSettings => unreachable!(),
+            };
+            handle_tray_action(ta, config, renderer, audio, tray_ui, dsh_url, elwt);
         }
     }
 }

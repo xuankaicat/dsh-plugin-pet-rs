@@ -35,6 +35,11 @@ const GAP_SPRAY: f32 = 26.0;
 /// 气泡浮入/浮出动画时长（毫秒）
 const BUBBLE_ANIM_IN_MS: f32 = 300.0;
 const BUBBLE_ANIM_OUT_MS: f32 = 260.0;
+/// 面板内右键菜单尺寸
+const MENU_W: f32 = 150.0;
+const MENU_ITEM_H: f32 = 26.0;
+const MENU_PAD: f32 = 4.0;
+const MENU_ITEM_COUNT: usize = 9;
 
 /// 气泡显示/隐藏动画状态：上浮出现、下浮消失
 #[derive(Clone, Copy)]
@@ -75,6 +80,20 @@ pub enum SettingsHit {
     ConfirmStopDshNo,
 }
 
+/// 面板内右键菜单动作（托盘创建失败时的兜底菜单）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuAction {
+    OpenGui,
+    OpenSettings,
+    ToggleBubble,
+    ToggleSound,
+    TestSound,
+    ScaleUp,
+    ScaleDown,
+    ScaleReset,
+    Quit,
+}
+
 pub struct Renderer {
     pixmap: Pixmap,
     assets: Arc<SpritePack>,
@@ -109,6 +128,10 @@ pub struct Renderer {
     confirm_stop_dsh: bool,
     confirm_yes_rect: Option<HitRect>,
     confirm_no_rect: Option<HitRect>,
+    /// 面板内右键菜单（托盘创建失败时的兜底）
+    menu_visible: bool,
+    menu_origin: (f32, f32),
+    menu_item_rects: Vec<HitRect>,
 }
 
 impl Renderer {
@@ -145,6 +168,9 @@ impl Renderer {
             confirm_stop_dsh: false,
             confirm_yes_rect: None,
             confirm_no_rect: None,
+            menu_visible: false,
+            menu_origin: (0.0, 0.0),
+            menu_item_rects: Vec::new(),
         }
     }
 
@@ -239,6 +265,11 @@ impl Renderer {
             self.confirm_no_rect = None;
         }
         self.draw_whale(snapshot, whale_y, time_ms);
+
+        // 面板内右键菜单（托盘创建失败时的兜底），画在最上层
+        if self.menu_visible {
+            self.draw_menu();
+        }
 
         // tiny-skia Pixmap::data() 返回 &[u8]，按 u32 重解释
         bytemuck::cast_slice(self.pixmap.data()).to_vec()
@@ -514,6 +545,65 @@ impl Renderer {
                 w - 28.0 * self.dpi_scale,
                 pop_alpha,
             );
+        }
+    }
+
+    /// 绘制面板内右键菜单（托盘创建失败时的兜底菜单）。
+    fn draw_menu(&mut self) {
+        let scale = self.dpi_scale;
+        let items: [(&str, ContextMenuAction); MENU_ITEM_COUNT] = [
+            ("打开 DSH GUI", ContextMenuAction::OpenGui),
+            ("打开设置", ContextMenuAction::OpenSettings),
+            (
+                if self.bubble_visible {
+                    "隐藏气泡"
+                } else {
+                    "显示气泡"
+                },
+                ContextMenuAction::ToggleBubble,
+            ),
+            (
+                if self.sound_on {
+                    "状态提示音（开）"
+                } else {
+                    "状态提示音（关）"
+                },
+                ContextMenuAction::ToggleSound,
+            ),
+            ("测试提示音", ContextMenuAction::TestSound),
+            ("放大", ContextMenuAction::ScaleUp),
+            ("缩小", ContextMenuAction::ScaleDown),
+            ("重置大小", ContextMenuAction::ScaleReset),
+            ("退出桌宠", ContextMenuAction::Quit),
+        ];
+
+        let item_h = MENU_ITEM_H * scale;
+        let pad = MENU_PAD * scale;
+        let menu_w = MENU_W * scale;
+        let menu_h = pad * 2.0 + items.len() as f32 * item_h;
+        let (ox, oy) = self.menu_origin;
+
+        // 背景：复用卡片圆角+阴影样式
+        self.draw_card_background(ox, oy, menu_w, menu_h, 1.0);
+        self.menu_item_rects = Vec::with_capacity(items.len());
+        for (i, (label, _action)) in items.iter().enumerate() {
+            let y = oy + pad + i as f32 * item_h;
+            let rect = HitRect {
+                x: ox + 4.0 * scale,
+                y,
+                w: menu_w - 8.0 * scale,
+                h: item_h,
+            };
+            self.draw_text(
+                label,
+                ox + 12.0 * scale,
+                y + 6.0 * scale,
+                13.0 * scale,
+                Color::from_rgba8(255, 255, 255, 235),
+                menu_w - 24.0 * scale,
+                1.0,
+            );
+            self.menu_item_rects.push(rect);
         }
     }
 
@@ -1119,6 +1209,61 @@ impl Renderer {
         if !visible {
             self.confirm_stop_dsh = false;
         }
+        if visible {
+            self.menu_visible = false;
+            self.menu_item_rects.clear();
+        }
+    }
+
+    /// 右键菜单是否可见。
+    pub fn menu_visible(&self) -> bool {
+        self.menu_visible
+    }
+
+    /// 关闭右键菜单。
+    pub fn set_menu_visible(&mut self, visible: bool) {
+        self.menu_visible = visible;
+        if !visible {
+            self.menu_item_rects.clear();
+        }
+    }
+
+    /// 在指定窗口坐标（物理像素）处打开右键菜单，位置自动收进窗口内。
+    pub fn open_menu(&mut self, x: f32, y: f32) {
+        self.settings_visible = false;
+        self.confirm_stop_dsh = false;
+        let scale = self.dpi_scale;
+        let menu_w = MENU_W * scale;
+        let menu_h = MENU_PAD * 2.0 * scale + MENU_ITEM_COUNT as f32 * MENU_ITEM_H * scale;
+        let w = self.pixmap.width() as f32;
+        let h = self.pixmap.height() as f32;
+        self.menu_origin = (
+            x.clamp(0.0, (w - menu_w).max(0.0)),
+            y.clamp(0.0, (h - menu_h).max(0.0)),
+        );
+        self.menu_visible = true;
+        self.menu_item_rects.clear();
+    }
+
+    /// 查询坐标处的菜单动作（仅当菜单可见时有效）。
+    pub fn menu_action_at(&self, x: f64, y: f64) -> Option<ContextMenuAction> {
+        const ACTIONS: [ContextMenuAction; MENU_ITEM_COUNT] = [
+            ContextMenuAction::OpenGui,
+            ContextMenuAction::OpenSettings,
+            ContextMenuAction::ToggleBubble,
+            ContextMenuAction::ToggleSound,
+            ContextMenuAction::TestSound,
+            ContextMenuAction::ScaleUp,
+            ContextMenuAction::ScaleDown,
+            ContextMenuAction::ScaleReset,
+            ContextMenuAction::Quit,
+        ];
+        for (i, rect) in self.menu_item_rects.iter().enumerate() {
+            if rect.contains(x, y) {
+                return ACTIONS.get(i).copied();
+            }
+        }
+        None
     }
 
     /// 切换面板内「终止 DSH 子进程」确认框。
