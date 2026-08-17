@@ -196,7 +196,8 @@ fn main() -> anyhow::Result<()> {
                         }
                         let _ = buffer.present();
                     }
-                    if Renderer::is_animating(last_snapshot.mode) {
+                    if Renderer::is_animating(last_snapshot.mode) || renderer.bubble_animating()
+                    {
                         window.request_redraw();
                     }
                 }
@@ -536,8 +537,16 @@ fn main() -> anyhow::Result<()> {
                 }
                 let now = Instant::now();
                 if click_tracker.poll_single_click(now) {
-                    let _ = open::that(&dsh_url);
+                    // 单击鲸鱼：切换气泡显示/隐藏（不再打开 DSH GUI）
+                    toggle_bubble(&mut config, &mut renderer, tray_ui.as_ref());
+                    window.request_redraw();
                 }
+                // 气泡浮入/浮出动画期间 60fps 持续重绘
+                let bubble_deadline = if renderer.bubble_animating() {
+                    Some(now + Duration::from_millis(16))
+                } else {
+                    None
+                };
                 // 设置面板展开时 60fps 持续重绘（光标闪烁、preedit 动画）
                 let settings_deadline = if renderer.settings_visible() {
                     Some(now + Duration::from_millis(16))
@@ -545,21 +554,20 @@ fn main() -> anyhow::Result<()> {
                     None
                 };
                 let click_deadline = click_tracker.next_deadline();
-                match (settings_deadline, click_deadline) {
-                    (Some(a), Some(b)) => {
-                        elwt.set_control_flow(ControlFlow::WaitUntil(a.min(b)));
-                        if a <= b {
+                let needs_redraw = bubble_deadline.is_some() || settings_deadline.is_some();
+                let deadline = bubble_deadline
+                    .into_iter()
+                    .chain(settings_deadline)
+                    .chain(click_deadline)
+                    .min();
+                match deadline {
+                    Some(d) => {
+                        elwt.set_control_flow(ControlFlow::WaitUntil(d));
+                        if needs_redraw {
                             window.request_redraw();
                         }
                     }
-                    (Some(a), None) => {
-                        elwt.set_control_flow(ControlFlow::WaitUntil(a));
-                        window.request_redraw();
-                    }
-                    (None, Some(b)) => {
-                        elwt.set_control_flow(ControlFlow::WaitUntil(b));
-                    }
-                    (None, None) => {
+                    None => {
                         elwt.set_control_flow(ControlFlow::Wait);
                     }
                 }
@@ -595,9 +603,7 @@ fn handle_tray_action(
             let _ = open::that(dsh_url);
         }
         TrayAction::ToggleBubble => {
-            config.bubble_visible = !config.bubble_visible;
-            renderer.set_bubble_visible(config.bubble_visible);
-            config.save();
+            toggle_bubble(config, renderer, tray_ui);
         }
         TrayAction::ToggleSound => {
             config.sound_on = !config.sound_on;
@@ -631,6 +637,16 @@ fn set_scale(config: &mut Config, renderer: &mut Renderer, scale: f32) {
     let scale = Config::clamp_scale(scale);
     config.scale = scale;
     renderer.set_pet_scale(scale);
+    config.save();
+}
+
+/// 切换气泡显示/隐藏（单击鲸鱼、托盘菜单共用），并同步托盘菜单文案。
+fn toggle_bubble(config: &mut Config, renderer: &mut Renderer, tray_ui: Option<&tray::TrayUi>) {
+    config.bubble_visible = !config.bubble_visible;
+    renderer.set_bubble_visible(config.bubble_visible);
+    if let Some(tray) = tray_ui {
+        tray.set_bubble_visible(config.bubble_visible);
+    }
     config.save();
 }
 

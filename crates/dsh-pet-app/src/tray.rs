@@ -37,11 +37,21 @@ static MENU_IDS: Mutex<Option<MenuIds>> = Mutex::new(None);
 pub struct TrayUi {
     _icon: TrayIcon,
     sound_item: CheckMenuItem,
+    bubble_item: MenuItem,
 }
 
 impl TrayUi {
     pub fn set_sound_on(&self, sound_on: bool) {
         self.sound_item.set_checked(sound_on);
+    }
+
+    /// 气泡显示/隐藏切换后，同步托盘菜单文案。
+    pub fn set_bubble_visible(&self, bubble_visible: bool) {
+        self.bubble_item.set_text(if bubble_visible {
+            "隐藏气泡"
+        } else {
+            "显示气泡"
+        });
     }
 }
 
@@ -110,6 +120,7 @@ pub fn create(sound_on: bool, bubble_visible: bool, scale: f32) -> Option<TrayUi
     Some(TrayUi {
         _icon: tray,
         sound_item: sound,
+        bubble_item: toggle_bubble,
     })
 }
 

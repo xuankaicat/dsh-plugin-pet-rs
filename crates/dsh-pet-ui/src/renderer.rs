@@ -32,6 +32,17 @@ const BUBBLE_BG: [u8; 4] = [14, 26, 78, 235];
 const GAP_NORMAL: f32 = 6.0;
 /// working/done 时水柱顶起的间距
 const GAP_SPRAY: f32 = 26.0;
+/// 气泡浮入/浮出动画时长（毫秒）
+const BUBBLE_ANIM_IN_MS: f32 = 300.0;
+const BUBBLE_ANIM_OUT_MS: f32 = 260.0;
+
+/// 气泡显示/隐藏动画状态：上浮出现、下浮消失
+#[derive(Clone, Copy)]
+enum BubbleAnim {
+    Idle,
+    Appearing { start: Instant },
+    Disappearing { start: Instant },
+}
 
 #[derive(Clone, Copy, Default)]
 struct HitRect {
@@ -67,6 +78,7 @@ pub struct Renderer {
     /// 用户配置的鲸鱼舞台比例（0.5–1.1），只影响 stage，不影响气泡。
     pet_scale: f32,
     bubble_visible: bool,
+    bubble_anim: BubbleAnim,
     settings_visible: bool,
     sound_on: bool,
     endpoint_text: String,
@@ -96,6 +108,7 @@ impl Renderer {
             dpi_scale,
             pet_scale,
             bubble_visible: true,
+            bubble_anim: BubbleAnim::Idle,
             settings_visible: false,
             sound_on: true,
             endpoint_text: String::new(),
@@ -156,11 +169,16 @@ impl Renderer {
             h: whale_h,
         });
 
-        if self.bubble_visible {
+        // 气泡浮入/浮出动画：上浮出现（自下而上浮入并淡入）、下浮消失（向下沉出并淡出）
+        let (bubble_offset, bubble_alpha) = self.bubble_anim_progress(bubble_h);
+        let show_bubble =
+            self.bubble_visible || matches!(self.bubble_anim, BubbleAnim::Disappearing { .. });
+        if show_bubble {
             let bubble_w = BUBBLE_W * self.dpi_scale;
+            let anim_y = bubble_y + bubble_offset;
             self.bubble_rect = Some(HitRect {
                 x: (self.pixmap.width() as f32 - bubble_w) / 2.0,
-                y: bubble_y,
+                y: anim_y,
                 w: bubble_w,
                 h: bubble_h + 9.0 * self.dpi_scale,
             });
@@ -170,7 +188,7 @@ impl Renderer {
                 self.settings_toggle_rect = None;
                 self.settings_close_rect = None;
                 self.settings_endpoint_rect = None;
-                self.draw_bubble(snapshot, bubble_y, time_ms);
+                self.draw_bubble(snapshot, anim_y, bubble_alpha, time_ms);
             }
         } else {
             self.bubble_rect = None;
@@ -373,7 +391,7 @@ impl Renderer {
         title_h + body_line_h * body_lines + padding
     }
 
-    fn draw_bubble(&mut self, snapshot: &Snapshot, y: f32, time_ms: u64) {
+    fn draw_bubble(&mut self, snapshot: &Snapshot, y: f32, anim_alpha: f32, time_ms: u64) {
         let _ = time_ms;
         let w = BUBBLE_W * self.dpi_scale;
         let h = self.measure_bubble_h(snapshot);
@@ -382,7 +400,8 @@ impl Renderer {
         // popIn 动画：模式变化后 400ms 内，scale 0.7 → 1.0
         let elapsed = self.mode_changed_at.elapsed().as_millis() as f32;
         let pop_progress = (elapsed / 400.0).min(1.0);
-        let pop_alpha = pop_progress;
+        // anim_alpha：气泡上浮出现 / 下浮消失的整体透明度
+        let pop_alpha = pop_progress * anim_alpha;
 
         self.draw_card_background(x, y, w, h, pop_alpha);
 
@@ -807,8 +826,62 @@ impl Renderer {
         self.pet_scale * self.dpi_scale
     }
 
+    /// 切换气泡显示/隐藏，并启动上浮出现 / 下浮消失动画。
     pub fn set_bubble_visible(&mut self, v: bool) {
+        if v == self.bubble_visible {
+            return;
+        }
         self.bubble_visible = v;
+        self.bubble_anim = if v {
+            BubbleAnim::Appearing {
+                start: Instant::now(),
+            }
+        } else {
+            BubbleAnim::Disappearing {
+                start: Instant::now(),
+            }
+        };
+    }
+
+    /// 气泡浮入/浮出动画进度：返回 (y 方向偏移, 整体透明度)。
+    /// 动画结束自动回到 Idle，返回 (0.0, 1.0)。
+    fn bubble_anim_progress(&mut self, slide: f32) -> (f32, f32) {
+        let (progress, dir) = match self.bubble_anim {
+            BubbleAnim::Idle => return (0.0, 1.0),
+            BubbleAnim::Appearing { start } => {
+                let t = (start.elapsed().as_millis() as f32 / BUBBLE_ANIM_IN_MS).min(1.0);
+                if t >= 1.0 {
+                    self.bubble_anim = BubbleAnim::Idle;
+                    return (0.0, 1.0);
+                }
+                (t, 1.0)
+            }
+            BubbleAnim::Disappearing { start } => {
+                let t = (start.elapsed().as_millis() as f32 / BUBBLE_ANIM_OUT_MS).min(1.0);
+                if t >= 1.0 {
+                    self.bubble_anim = BubbleAnim::Idle;
+                    return (0.0, 1.0);
+                }
+                (t, -1.0)
+            }
+        };
+        if dir > 0.0 {
+            // 上浮出现：自下而上浮入并淡入
+            let e = ease_out_cubic(progress);
+            (slide * (1.0 - e), e)
+        } else {
+            // 下浮消失：向下沉出并淡出
+            let e = ease_in_cubic(progress);
+            (slide * e, 1.0 - e)
+        }
+    }
+
+    /// 气泡浮入/浮出动画是否进行中（用于决定是否 request_redraw）
+    pub fn bubble_animating(&self) -> bool {
+        matches!(
+            self.bubble_anim,
+            BubbleAnim::Appearing { .. } | BubbleAnim::Disappearing { .. }
+        )
     }
 
     pub fn set_settings_visible(&mut self, visible: bool) {
@@ -1123,6 +1196,16 @@ fn ease_out_back(t: f32) -> f32 {
     let c1 = 1.70158;
     let c3 = c1 + 1.0;
     1.0 + c3 * (t - 1.0).powi(3) + c1 * (t - 1.0).powi(2)
+}
+
+/// 上浮出现缓动：快起缓落（decelerate）
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// 下浮消失缓动：缓起快落（accelerate）
+fn ease_in_cubic(t: f32) -> f32 {
+    t.powi(3)
 }
 
 /// zzz 动画变换：styles.css L133-137
