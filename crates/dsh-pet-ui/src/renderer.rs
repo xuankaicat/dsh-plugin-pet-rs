@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ab_glyph::{point, Font, FontArc, ScaleFont};
-use dsh_pet_core::{Mode, Snapshot, SpritePack};
+use dsh_pet_core::{Bubble, Mode, Snapshot, SpritePack};
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, PixmapPaint, Transform};
 
 use crate::emoji::EmojiAtlas;
@@ -26,6 +26,8 @@ const _CANVAS_FULL_H: f32 = 174.0;
 const BUBBLE_W: f32 = 252.0;
 const BUBBLE_RADIUS: f32 = 14.0;
 const SETTINGS_H: f32 = 162.0;
+/// 「是否安装 DSH」确认面板高度
+const INSTALL_PROMPT_H: f32 = 190.0;
 /// 气泡背景色 rgba(14,26,78,0.92) ≈ alpha 235
 const BUBBLE_BG: [u8; 4] = [14, 26, 78, 235];
 /// 气泡与鲸鱼间距
@@ -81,6 +83,20 @@ pub enum SettingsHit {
     /// 动画帧率选择（30 / 60 fps）
     FrameRate30,
     FrameRate60,
+}
+
+/// 安装 DSH 确认面板的点击动作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPromptAction {
+    None,
+    /// 官方源
+    Official,
+    /// npmmirror（阿里）
+    Npmmirror,
+    /// 腾讯云镜像
+    Tencent,
+    /// 取消安装
+    Cancel,
 }
 
 /// 面板内右键菜单动作（托盘创建失败时的兜底菜单）。
@@ -139,6 +155,14 @@ pub struct Renderer {
     anim_fps: u32,
     fps30_rect: Option<HitRect>,
     fps60_rect: Option<HitRect>,
+    /// 覆盖状态气泡的进度/结果气泡（安装 DSH 等）
+    status_bubble: Option<Bubble>,
+    /// 是否正在显示「是否安装 DSH」确认面板
+    install_prompt: bool,
+    install_official_rect: Option<HitRect>,
+    install_npmmirror_rect: Option<HitRect>,
+    install_tencent_rect: Option<HitRect>,
+    install_cancel_rect: Option<HitRect>,
 }
 
 impl Renderer {
@@ -181,6 +205,12 @@ impl Renderer {
             anim_fps: 30,
             fps30_rect: None,
             fps60_rect: None,
+            status_bubble: None,
+            install_prompt: false,
+            install_official_rect: None,
+            install_npmmirror_rect: None,
+            install_tencent_rect: None,
+            install_cancel_rect: None,
         }
     }
 
@@ -202,19 +232,33 @@ impl Renderer {
     pub fn render(&mut self, snapshot: &Snapshot, time_ms: u64) -> Vec<u32> {
         self.pixmap.fill(Color::TRANSPARENT);
 
-        let gap = match snapshot.mode {
-            Mode::Working | Mode::Done => GAP_SPRAY,
-            _ => GAP_NORMAL,
-        } * self.dpi_scale;
+        // 进度/结果气泡存在时，气泡内容以 status_bubble 为准，且不随 running/done 水柱顶起
+        let bubble_snapshot = if let Some(status) = &self.status_bubble {
+            let mut snap = snapshot.clone();
+            snap.bubble = status.clone();
+            snap
+        } else {
+            snapshot.clone()
+        };
+        let gap = if self.status_bubble.is_some() {
+            GAP_NORMAL * self.dpi_scale
+        } else {
+            (match snapshot.mode {
+                Mode::Working | Mode::Done => GAP_SPRAY,
+                _ => GAP_NORMAL,
+            }) * self.dpi_scale
+        };
 
         // 布局：从下往上 — 鲸鱼在底部，气泡在上方
         let stage_scale = self.stage_scale();
         let whale_h = STAGE_FULL_H * stage_scale;
         let whale_y = self.pixmap.height() as f32 - whale_h - 6.0 * self.dpi_scale;
-        let bubble_h = if self.settings_visible {
+        let bubble_h = if self.install_prompt {
+            INSTALL_PROMPT_H * self.dpi_scale
+        } else if self.settings_visible {
             SETTINGS_H * self.dpi_scale
         } else {
-            self.measure_bubble_h(snapshot)
+            self.measure_bubble_h(&bubble_snapshot)
         };
         let bubble_y = (whale_y - gap - bubble_h).max(0.0);
 
@@ -228,7 +272,31 @@ impl Renderer {
 
         // 气泡浮入/浮出动画：上浮出现（自下而上浮入并淡入）、下浮消失（向下沉出并淡出）
         let (bubble_offset, bubble_alpha) = self.bubble_anim_progress(bubble_h);
-        if self.settings_visible {
+        let status_alpha = if self.status_bubble.is_some() {
+            1.0
+        } else {
+            bubble_alpha
+        };
+        if self.install_prompt {
+            // 安装确认面板：占据气泡区域
+            let bubble_w = BUBBLE_W * self.dpi_scale;
+            self.bubble_rect = Some(HitRect {
+                x: (self.pixmap.width() as f32 - bubble_w) / 2.0,
+                y: bubble_y,
+                w: bubble_w,
+                h: bubble_h + 9.0 * self.dpi_scale,
+            });
+            self.settings_toggle_rect = None;
+            self.settings_close_rect = None;
+            self.settings_endpoint_rect = None;
+            self.settings_spawn_rect = None;
+            self.settings_restart_rect = None;
+            self.confirm_yes_rect = None;
+            self.confirm_no_rect = None;
+            self.fps30_rect = None;
+            self.fps60_rect = None;
+            self.draw_install_prompt(bubble_y);
+        } else if self.settings_visible {
             // 设置面板始终绘制（与气泡显隐无关），占据气泡区域
             let bubble_w = BUBBLE_W * self.dpi_scale;
             self.bubble_rect = Some(HitRect {
@@ -246,12 +314,21 @@ impl Renderer {
             self.confirm_no_rect = None;
             self.fps30_rect = None;
             self.fps60_rect = None;
+            self.install_official_rect = None;
+            self.install_npmmirror_rect = None;
+            self.install_tencent_rect = None;
+            self.install_cancel_rect = None;
             self.draw_settings(bubble_y, time_ms);
-        } else if self.bubble_visible
+        } else if self.status_bubble.is_some()
+            || self.bubble_visible
             || matches!(self.bubble_anim, BubbleAnim::Disappearing { .. })
         {
             let bubble_w = BUBBLE_W * self.dpi_scale;
-            let anim_y = bubble_y + bubble_offset;
+            let anim_y = if self.status_bubble.is_some() {
+                bubble_y
+            } else {
+                bubble_y + bubble_offset
+            };
             self.bubble_rect = Some(HitRect {
                 x: (self.pixmap.width() as f32 - bubble_w) / 2.0,
                 y: anim_y,
@@ -267,7 +344,11 @@ impl Renderer {
             self.confirm_no_rect = None;
             self.fps30_rect = None;
             self.fps60_rect = None;
-            self.draw_bubble(snapshot, anim_y, bubble_alpha, time_ms);
+            self.install_official_rect = None;
+            self.install_npmmirror_rect = None;
+            self.install_tencent_rect = None;
+            self.install_cancel_rect = None;
+            self.draw_bubble(&bubble_snapshot, anim_y, status_alpha, time_ms);
         } else {
             self.bubble_rect = None;
             self.settings_toggle_rect = None;
@@ -279,6 +360,10 @@ impl Renderer {
             self.confirm_no_rect = None;
             self.fps30_rect = None;
             self.fps60_rect = None;
+            self.install_official_rect = None;
+            self.install_npmmirror_rect = None;
+            self.install_tencent_rect = None;
+            self.install_cancel_rect = None;
         }
         self.draw_whale(snapshot, whale_y, time_ms);
 
@@ -706,6 +791,133 @@ impl Renderer {
         });
     }
 
+    /// 绘制「是否安装 DSH」确认面板：官方源 / npmmirror / 腾讯源 / 取消。
+    fn draw_install_prompt(&mut self, y: f32) {
+        let scale = self.dpi_scale;
+        let w = BUBBLE_W * scale;
+        let h = INSTALL_PROMPT_H * scale;
+        let x = (self.pixmap.width() as f32 - w) / 2.0;
+        self.draw_card_background(x, y, w, h, 1.0);
+
+        self.draw_text(
+            "未检测到 DSH",
+            x + 14.0 * scale,
+            y + 10.0 * scale,
+            16.0 * scale,
+            Color::WHITE,
+            w - 28.0 * scale,
+            1.0,
+        );
+        self.draw_text(
+            "是否安装 @deepseek-ai/dsh？请选择安装源",
+            x + 14.0 * scale,
+            y + 34.0 * scale,
+            13.0 * scale,
+            Color::from_rgba8(255, 255, 255, 230),
+            w - 28.0 * scale,
+            1.0,
+        );
+
+        let btn_w = 104.0 * scale;
+        let btn_h = 28.0 * scale;
+        let gap = 8.0 * scale;
+        let start_x = x + 14.0 * scale;
+        let row1_y = y + 62.0 * scale;
+        let row2_y = y + 98.0 * scale;
+        let font_size = 13.0 * scale;
+
+        let official = HitRect {
+            x: start_x,
+            y: row1_y,
+            w: btn_w,
+            h: btn_h,
+        };
+        self.fill_rounded_rect(official, 6.0 * scale, Color::from_rgba8(92, 160, 255, 235));
+        let label = "官方源";
+        let label_w = self.measure_text_width(label, font_size);
+        self.draw_text(
+            label,
+            official.x + (official.w - label_w) / 2.0,
+            official.y + 7.0 * scale,
+            font_size,
+            Color::WHITE,
+            official.w,
+            1.0,
+        );
+
+        let npmmirror = HitRect {
+            x: start_x + btn_w + gap,
+            y: row1_y,
+            w: btn_w,
+            h: btn_h,
+        };
+        self.fill_rounded_rect(npmmirror, 6.0 * scale, Color::from_rgba8(92, 215, 170, 235));
+        let label = "npmmirror";
+        let label_w = self.measure_text_width(label, font_size);
+        self.draw_text(
+            label,
+            npmmirror.x + (npmmirror.w - label_w) / 2.0,
+            npmmirror.y + 7.0 * scale,
+            font_size,
+            Color::WHITE,
+            npmmirror.w,
+            1.0,
+        );
+
+        let tencent = HitRect {
+            x: start_x,
+            y: row2_y,
+            w: btn_w,
+            h: btn_h,
+        };
+        self.fill_rounded_rect(tencent, 6.0 * scale, Color::from_rgba8(255, 170, 90, 235));
+        let label = "腾讯源";
+        let label_w = self.measure_text_width(label, font_size);
+        self.draw_text(
+            label,
+            tencent.x + (tencent.w - label_w) / 2.0,
+            tencent.y + 7.0 * scale,
+            font_size,
+            Color::WHITE,
+            tencent.w,
+            1.0,
+        );
+
+        let cancel = HitRect {
+            x: start_x + btn_w + gap,
+            y: row2_y,
+            w: btn_w,
+            h: btn_h,
+        };
+        self.fill_rounded_rect(cancel, 6.0 * scale, Color::from_rgba8(91, 104, 150, 235));
+        let label = "取消";
+        let label_w = self.measure_text_width(label, font_size);
+        self.draw_text(
+            label,
+            cancel.x + (cancel.w - label_w) / 2.0,
+            cancel.y + 7.0 * scale,
+            font_size,
+            Color::from_rgba8(255, 255, 255, 235),
+            cancel.w,
+            1.0,
+        );
+
+        self.draw_text(
+            "将写入 npm 全局目录",
+            x + 14.0 * scale,
+            y + 142.0 * scale,
+            11.0 * scale,
+            Color::from_rgba8(255, 255, 255, 150),
+            w - 28.0 * scale,
+            1.0,
+        );
+
+        self.install_official_rect = Some(official);
+        self.install_npmmirror_rect = Some(npmmirror);
+        self.install_tencent_rect = Some(tencent);
+        self.install_cancel_rect = Some(cancel);
+    }
+
     fn draw_settings(&mut self, y: f32, time_ms: u64) {
         let scale = self.dpi_scale;
         let w = BUBBLE_W * scale;
@@ -986,11 +1198,7 @@ impl Renderer {
                         w: preedit_w,
                         h: 1.0 * scale,
                     };
-                    self.fill_rounded_rect(
-                        underline,
-                        0.0,
-                        Color::from_rgba8(150, 180, 255, 200),
-                    );
+                    self.fill_rounded_rect(underline, 0.0, Color::from_rgba8(150, 180, 255, 200));
                 }
             }
 
@@ -1003,11 +1211,7 @@ impl Renderer {
                         w: 1.0 * scale,
                         h: 16.0 * scale,
                     };
-                    self.fill_rounded_rect(
-                        cursor_rect,
-                        0.0,
-                        Color::from_rgba8(255, 255, 255, 220),
-                    );
+                    self.fill_rounded_rect(cursor_rect, 0.0, Color::from_rgba8(255, 255, 255, 220));
                 }
             }
         }
@@ -1208,6 +1412,62 @@ impl Renderer {
 
     fn stage_scale(&self) -> f32 {
         self.pet_scale * self.dpi_scale
+    }
+
+    /// 覆盖状态气泡的进度/结果气泡（安装 DSH 等）。
+    pub fn set_status_bubble(&mut self, bubble: Option<Bubble>) {
+        self.status_bubble = bubble;
+    }
+
+    /// 是否存在进度/结果气泡（用于拦截点击、区分结果可关闭）。
+    pub fn status_bubble_visible(&self) -> bool {
+        self.status_bubble.is_some()
+    }
+
+    /// 是否正在显示「是否安装 DSH」确认面板。
+    pub fn install_prompt_visible(&self) -> bool {
+        self.install_prompt
+    }
+
+    /// 显示/隐藏「是否安装 DSH」确认面板。
+    pub fn set_install_prompt(&mut self, visible: bool) {
+        self.install_prompt = visible;
+        if !visible {
+            self.install_official_rect = None;
+            self.install_npmmirror_rect = None;
+            self.install_tencent_rect = None;
+            self.install_cancel_rect = None;
+        }
+    }
+
+    /// 查询坐标处的安装确认面板动作。
+    pub fn install_prompt_hit_test(&self, x: f64, y: f64) -> InstallPromptAction {
+        if !self.install_prompt {
+            return InstallPromptAction::None;
+        }
+        if self
+            .install_official_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            InstallPromptAction::Official
+        } else if self
+            .install_npmmirror_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            InstallPromptAction::Npmmirror
+        } else if self
+            .install_tencent_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            InstallPromptAction::Tencent
+        } else if self
+            .install_cancel_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            InstallPromptAction::Cancel
+        } else {
+            InstallPromptAction::None
+        }
     }
 
     /// 切换气泡显示/隐藏，并启动上浮出现 / 下浮消失动画。
@@ -1607,20 +1867,11 @@ impl Renderer {
             .is_some_and(|rect| rect.contains(x, y))
         {
             SettingsHit::ConfirmStopDshYes
-        } else if self
-            .confirm_no_rect
-            .is_some_and(|rect| rect.contains(x, y))
-        {
+        } else if self.confirm_no_rect.is_some_and(|rect| rect.contains(x, y)) {
             SettingsHit::ConfirmStopDshNo
-        } else if self
-            .fps30_rect
-            .is_some_and(|rect| rect.contains(x, y))
-        {
+        } else if self.fps30_rect.is_some_and(|rect| rect.contains(x, y)) {
             SettingsHit::FrameRate30
-        } else if self
-            .fps60_rect
-            .is_some_and(|rect| rect.contains(x, y))
-        {
+        } else if self.fps60_rect.is_some_and(|rect| rect.contains(x, y)) {
             SettingsHit::FrameRate60
         } else if self
             .settings_restart_rect

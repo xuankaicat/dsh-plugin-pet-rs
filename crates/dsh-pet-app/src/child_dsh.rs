@@ -1,9 +1,13 @@
 //! DSH 子进程管理：由桌宠拉起 `dsh --profile web` 并负责回收。
 //!
-//! 启动方式按优先级自动尝试（哪个能跑起来用哪个）：
+//! 启动方式：
 //! 1. `dsh` —— PATH 中的真实可执行文件（Unix 主要路径）；
-//! 2. `cmd /C dsh ...` —— Windows 上解析 PATH 中的 `.cmd` shim（npm 全局安装）；
-//! 3. `npx --yes @deepseek-ai/dsh ...` —— npm on-demand，无需全局安装。
+//! 2. `cmd /C dsh ...` —— Windows 上解析 PATH 中的 `.cmd` shim（npm 全局安装）。
+//!
+//! 如果环境中没有 dsh，则返回 `StartError::NotInstalled` 交给桌宠弹窗确认；
+//! 用户选择安装源后由 `install` 执行
+//! `npm install -g @deepseek-ai/dsh --verbose --registry=<源>`，
+//! 并把下载进度逐行抛给桌宠气泡，安装完成后重试启动。
 //!
 //! 优先使用默认端口 3080（与 DSH 默认地址 http://127.0.0.1:3080 一致），
 //! 被占用时回退 `--port 0` 由系统分配空闲端口；实际地址由子进程 stdout
@@ -18,12 +22,47 @@ use tokio::time::timeout;
 
 /// 单个候选启动方式的等待超时
 const DIRECT_TIMEOUT: Duration = Duration::from_secs(8);
-const NPX_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 优先使用的端口：与 DSH 默认地址 http://127.0.0.1:3080 保持一致。
 const PREFERRED_PORT: &str = "3080";
 /// 端口被占用时的回退：`--port 0` 让系统分配空闲端口。
 const FALLBACK_PORT: &str = "0";
+
+/// npm 安装源
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registry {
+    /// 官方源
+    Official,
+    /// npmmirror（阿里）
+    Npmmirror,
+    /// 腾讯云镜像
+    Tencent,
+}
+
+impl Registry {
+    pub fn label(self) -> &'static str {
+        match self {
+            Registry::Official => "官方源",
+            Registry::Npmmirror => "npmmirror",
+            Registry::Tencent => "腾讯源",
+        }
+    }
+
+    pub fn url(self) -> &'static str {
+        match self {
+            Registry::Official => "https://registry.npmjs.org/",
+            Registry::Npmmirror => "https://registry.npmmirror.com",
+            Registry::Tencent => "https://mirrors.cloud.tencent.com/npm/",
+        }
+    }
+}
+
+/// 启动 DSH 的失败类型
+#[derive(Debug)]
+pub enum StartError {
+    /// 环境中没有 dsh，需要用户确认后安装
+    NotInstalled { errors: Vec<String> },
+}
 
 /// 成功拉起并解析出地址的子进程
 pub struct SpawnedDsh {
@@ -73,55 +112,162 @@ impl Drop for ChildGuard {
     }
 }
 
-/// 按优先级依次尝试所有候选启动方式与端口，返回第一个解析出地址的。
-/// 端口优先使用默认的 3080，被占用时回退到系统分配端口。
-pub async fn start() -> Result<SpawnedDsh, String> {
+/// 启动 DSH：只尝试 PATH 中已有的 dsh；找不到则返回 `NotInstalled`，
+/// 由上层弹窗让用户选择是否安装及安装源。
+pub async fn start() -> Result<SpawnedDsh, StartError> {
     let mut errors: Vec<String> = Vec::new();
 
     for port in [PREFERRED_PORT, FALLBACK_PORT] {
-        let args = ["--profile", "web", "--host", "127.0.0.1", "--port", port];
+        if let Some(spawned) = try_existing_candidates(port, &mut errors).await {
+            return Ok(spawned);
+        }
+    }
 
-        // 1) PATH 中的 dsh（Unix 上的可执行脚本；Windows 上若存在 dsh.exe 也可用）
-        match try_launch("dsh", &args, DIRECT_TIMEOUT).await {
-            Ok(s) => return Ok(s),
+    Err(StartError::NotInstalled { errors })
+}
+
+/// 尝试已安装的 dsh：直接执行（Unix；Windows 上若存在 dsh.exe 也可用），
+/// Windows 再尝试 `cmd /C dsh`（解析 npm 全局安装产生的 dsh.cmd shim）。
+async fn try_existing_candidates(port: &str, errors: &mut Vec<String>) -> Option<SpawnedDsh> {
+    let args = ["--profile", "web", "--host", "127.0.0.1", "--port", port];
+
+    match try_launch("dsh", &args, DIRECT_TIMEOUT).await {
+        Ok(s) => return Some(s),
+        Err(e) => errors.push(e),
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd_args = vec!["/C", "dsh"];
+        cmd_args.extend_from_slice(&args);
+        match try_launch("cmd", &cmd_args, DIRECT_TIMEOUT).await {
+            Ok(s) => return Some(s),
             Err(e) => errors.push(e),
         }
+    }
 
-        #[cfg(target_os = "windows")]
-        {
-            // 2) cmd /C dsh（解析 npm 全局安装产生的 dsh.cmd shim）
-            let mut cmd_args = vec!["/C", "dsh"];
-            cmd_args.extend_from_slice(&args);
-            match try_launch("cmd", &cmd_args, DIRECT_TIMEOUT).await {
-                Ok(s) => return Ok(s),
-                Err(e) => errors.push(e),
+    None
+}
+
+/// npm 全局安装 @deepseek-ai/dsh（指定安装源），并逐行回传 --verbose 下载进度。
+pub async fn install<F>(registry: Registry, on_line: F) -> Result<(), String>
+where
+    F: Fn(String) + Send + Sync + 'static,
+{
+    let status = npm_install_status(registry, &on_line).await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "npm install 退出码 {}",
+            status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ))
+    }
+}
+
+async fn npm_install_status<F>(
+    registry: Registry,
+    on_line: &F,
+) -> Result<std::process::ExitStatus, String>
+where
+    F: Fn(String) + Send + Sync + 'static,
+{
+    let args = [
+        "install",
+        "-g",
+        "@deepseek-ai/dsh",
+        "--verbose",
+        "--registry",
+        registry.url(),
+    ];
+    match run_streaming("npm", &args, on_line).await {
+        Ok(status) => Ok(status),
+        Err(_e) => {
+            #[cfg(target_os = "windows")]
+            {
+                on_line("npm 不在 PATH，尝试 cmd /C npm…".to_string());
+                let mut cmd_args = vec!["/C", "npm"];
+                cmd_args.extend_from_slice(&args);
+                run_streaming("cmd", &cmd_args, on_line).await
             }
-
-            // 3) npx on-demand（用户常见用法：npx @deepseek-ai/dsh web）
-            let mut npx_args = vec!["/C", "npx", "--yes", "@deepseek-ai/dsh"];
-            npx_args.extend_from_slice(&args);
-            match try_launch("cmd", &npx_args, NPX_TIMEOUT).await {
-                Ok(s) => return Ok(s),
-                Err(e) => errors.push(e),
+            #[cfg(not(target_os = "windows"))]
+            {
+                Err(_e)
             }
         }
+    }
+}
 
-        #[cfg(not(target_os = "windows"))]
-        {
-            // 2) npx on-demand（Unix 直接执行 npx）
-            let mut npx_args = vec!["--yes", "@deepseek-ai/dsh"];
-            npx_args.extend_from_slice(&args);
-            match try_launch("npx", &npx_args, NPX_TIMEOUT).await {
-                Ok(s) => return Ok(s),
-                Err(e) => errors.push(e),
+/// 运行一个命令，合并 stdout/stderr 并逐行交给回调，返回进程退出状态。
+async fn run_streaming<F>(
+    program: &str,
+    args: &[&str],
+    on_line: &F,
+) -> Result<std::process::ExitStatus, String>
+where
+    F: Fn(String) + Send + Sync + 'static,
+{
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    {
+        // CREATE_NO_WINDOW：后台静默启动，不弹出 CLI/控制台窗口
+        cmd.creation_flags(0x0800_0000);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("无法执行 {program}: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{program}: 无法接管 stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{program}: 无法接管 stderr"))?;
+
+    let mut stdout_lines = BufReader::new(stdout).lines();
+    let mut stderr_lines = BufReader::new(stderr).lines();
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+
+    while !(stdout_done && stderr_done) {
+        tokio::select! {
+            line = stdout_lines.next_line(), if !stdout_done => {
+                match line {
+                    Ok(Some(line)) => on_line(crate::term::clean_line(&line)),
+                    Ok(None) => stdout_done = true,
+                    Err(e) => {
+                        on_line(format!("[stdout] {e}"));
+                        stdout_done = true;
+                    }
+                }
+            }
+            line = stderr_lines.next_line(), if !stderr_done => {
+                match line {
+                    Ok(Some(line)) => on_line(crate::term::clean_line(&line)),
+                    Ok(None) => stderr_done = true,
+                    Err(e) => {
+                        on_line(format!("[stderr] {e}"));
+                        stderr_done = true;
+                    }
+                }
             }
         }
     }
 
-    Err(format!(
-        "无法启动 DSH：{}。可执行 npm install -g @deepseek-ai/dsh 安装，或确保 dsh 命令在 PATH 中",
-        errors.join("；")
-    ))
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("等待 {program} 退出失败: {e}"))?;
+    Ok(status)
 }
 
 /// 以给定命令启动并等待地址输出；失败时回收子进程并返回错误说明。
@@ -160,7 +306,10 @@ async fn try_launch(program: &str, args: &[&str], wait: Duration) -> Result<Spaw
     match result {
         Ok(Ok(url)) => Ok(SpawnedDsh { child: guard, url }),
         Ok(Err(e)) => Err(format!("{program}: {e}")),
-        Err(_) => Err(format!("{program}: 启动超时（{}s 内未输出地址）", wait.as_secs())),
+        Err(_) => Err(format!(
+            "{program}: 启动超时（{}s 内未输出地址）",
+            wait.as_secs()
+        )),
     }
 }
 

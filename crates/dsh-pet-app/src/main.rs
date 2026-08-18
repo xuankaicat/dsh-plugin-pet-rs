@@ -7,7 +7,10 @@
 //
 // release 版在 Windows 上以 GUI 子系统链接：双击 exe 纯 GUI 启动，不弹控制台窗口（CLI）。
 // debug 构建保持控制台子系统，便于开发时在终端查看日志。
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 #![allow(deprecated)]
 
 mod audio;
@@ -15,15 +18,17 @@ mod child_dsh;
 mod platform;
 mod shot_mode;
 mod tasks;
+mod term;
 mod tray;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use dsh_pet_core::{Config, Mode, PetState, Snapshot, StateEvent};
+use dsh_pet_core::{Bubble, Config, Mode, PetState, Snapshot, StateEvent};
 use dsh_pet_ui::{
-    create_window, ClickTarget, ContextMenuAction, InputAction, InputState, Renderer, SettingsHit,
+    create_window, ClickTarget, ContextMenuAction, InputAction, InputState, InstallPromptAction,
+    Renderer, SettingsHit,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -45,6 +50,12 @@ enum UserEvent {
     DshChildUrl(String),
     /// DSH 子进程启动失败
     DshChildFailed(String),
+    /// 进度气泡开始（安装 DSH）
+    ProgressStart { title: String },
+    /// 进度气泡一行输出
+    ProgressLine(String),
+    /// 未检测到 dsh，需要用户选择是否安装及安装源
+    InstallPrompt { errors: String },
 }
 
 /// 透明区域点击穿透的轮询间隔（毫秒）
@@ -183,6 +194,13 @@ fn main() -> anyhow::Result<()> {
     let dsh_child: Arc<Mutex<Option<child_dsh::ChildGuard>>> = Arc::new(Mutex::new(None));
     // 启动任务代际号：关闭/重启时 +1，使在途的旧启动任务失效
     let dsh_gen = Arc::new(AtomicU64::new(0));
+    // 进度气泡状态：DSH 安装命令的标题与最近输出行
+    let mut progress_title: Option<String> = None;
+    let mut progress_lines: Vec<String> = Vec::new();
+    // 结果气泡自动清除时间
+    let mut status_until: Option<Instant> = None;
+    // 是否正在等待用户选择是否安装 DSH
+    let mut install_pending = false;
     // 启动时检测默认端口是否已有 DSH：有则关闭子进程模式，直接连接现有实例
     if config.spawn_dsh && dsh_server_running(&rt, &http) {
         tracing::info!(
@@ -194,7 +212,13 @@ fn main() -> anyhow::Result<()> {
         config.save();
     }
     if config.spawn_dsh {
-        spawn_dsh_task(&rt, &proxy, &dsh_child, &dsh_gen, dsh_gen.load(Ordering::SeqCst));
+        spawn_dsh_task(
+            &rt,
+            &proxy,
+            &dsh_child,
+            &dsh_gen,
+            dsh_gen.load(Ordering::SeqCst),
+        );
     }
 
     // 主事件循环
@@ -298,183 +322,244 @@ fn main() -> anyhow::Result<()> {
                     };
                     if !menu_handled {
                         match action {
-                        InputAction::Click(ClickTarget::Whale) => {
-                            // 单击鲸鱼：先提交 endpoint 编辑
-                            commit_endpoint_if_focused(
-                                &mut renderer,
-                                &mut config,
-                                &mut dsh_url,
-                                &mut net_cancel,
-                                &rt,
-                                &http,
-                                &event_tx,
-                            );
-                            if !renderer.endpoint_focused() {
-                                window.set_ime_allowed(false);
+                            InputAction::Click(ClickTarget::Whale) => {
+                                // 单击鲸鱼：先提交 endpoint 编辑
+                                commit_endpoint_if_focused(
+                                    &mut renderer,
+                                    &mut config,
+                                    &mut dsh_url,
+                                    &mut net_cancel,
+                                    &rt,
+                                    &http,
+                                    &event_tx,
+                                );
+                                if !renderer.endpoint_focused() {
+                                    window.set_ime_allowed(false);
+                                }
+                                if renderer.settings_visible() {
+                                    // 设置面板打开时，单击鲸鱼 → 关闭面板（丢弃未提交编辑）
+                                    renderer.set_endpoint_focused(false);
+                                    window.set_ime_allowed(false);
+                                    renderer.set_endpoint_text(dsh_url.clone());
+                                    renderer.set_settings_visible(false);
+                                } else {
+                                    // 否则切换气泡显示/隐藏（无延迟）
+                                    toggle_bubble(&mut config, &mut renderer, tray_ui.as_ref());
+                                }
+                                window.request_redraw();
                             }
-                            if renderer.settings_visible() {
-                                // 设置面板打开时，单击鲸鱼 → 关闭面板（丢弃未提交编辑）
-                                renderer.set_endpoint_focused(false);
-                                window.set_ime_allowed(false);
-                                renderer.set_endpoint_text(dsh_url.clone());
-                                renderer.set_settings_visible(false);
-                            } else {
-                                // 否则切换气泡显示/隐藏（无延迟）
-                                toggle_bubble(&mut config, &mut renderer, tray_ui.as_ref());
-                            }
-                            window.request_redraw();
-                        }
-                        InputAction::Click(ClickTarget::Bubble) => {
-                            if renderer.settings_visible() {
-                                let (x, y) = input.cursor_position();
-                                match renderer.settings_hit_test(x, y) {
-                                    SettingsHit::ToggleSound => {
-                                        // 点击开关前先提交 endpoint 编辑
-                                        commit_endpoint_if_focused(
-                                            &mut renderer,
-                                            &mut config,
-                                            &mut dsh_url,
-                                            &mut net_cancel,
-                                            &rt,
-                                            &http,
-                                            &event_tx,
-                                        );
-                                        if !renderer.endpoint_focused() {
-                                            window.set_ime_allowed(false);
-                                        }
-                                        config.sound_on = !config.sound_on;
-                                        renderer.set_sound_on(config.sound_on);
-                                        if let Some(tray) = tray_ui.as_ref() {
-                                            tray.set_sound_on(config.sound_on);
-                                        }
-                                        config.save();
-                                    }
-                                    SettingsHit::EndpointInput => {
-                                        renderer.set_endpoint_focused(true);
-                                        window.set_ime_allowed(true);
-                                        if let Some((x, y, w, h)) = renderer.endpoint_ime_area() {
-                                            window.set_ime_cursor_area(
-                                                winit::dpi::PhysicalPosition::new(
-                                                    x as i32, y as i32,
-                                                ),
-                                                winit::dpi::PhysicalSize::new(w as u32, h as u32),
-                                            );
-                                        }
-                                    }
-                                    SettingsHit::Close => {
-                                        // 关闭面板前丢弃 endpoint 编辑
-                                        renderer.set_endpoint_focused(false);
-                                        window.set_ime_allowed(false);
-                                        renderer.set_endpoint_text(dsh_url.clone());
-                                        renderer.set_settings_visible(false);
-                                    }
-                                    SettingsHit::SpawnDsh => {
-                                        if config.spawn_dsh {
-                                            // 关闭子进程模式：先弹面板内确认（不再用原生 MessageBox）
-                                            renderer.set_confirm_stop_dsh(true);
+                            InputAction::Click(ClickTarget::Bubble) => {
+                                if renderer.install_prompt_visible() {
+                                    let (x, y) = input.cursor_position();
+                                    match renderer.install_prompt_hit_test(x, y) {
+                                        InstallPromptAction::Official
+                                        | InstallPromptAction::Npmmirror
+                                        | InstallPromptAction::Tencent => {
+                                            if install_pending {
+                                                install_pending = false;
+                                                let registry =
+                                                    match renderer.install_prompt_hit_test(x, y) {
+                                                        InstallPromptAction::Official => {
+                                                            child_dsh::Registry::Official
+                                                        }
+                                                        InstallPromptAction::Npmmirror => {
+                                                            child_dsh::Registry::Npmmirror
+                                                        }
+                                                        _ => child_dsh::Registry::Tencent,
+                                                    };
+                                                renderer.set_install_prompt(false);
+                                                spawn_install_and_retry_dsh(
+                                                    &rt,
+                                                    &proxy,
+                                                    &dsh_child,
+                                                    &dsh_gen,
+                                                    dsh_gen.load(Ordering::SeqCst),
+                                                    registry,
+                                                );
+                                            }
                                             window.request_redraw();
-                                        } else {
-                                            // 开启子进程模式：地址框显示「启动中…」，后台拉起
-                                            config.spawn_dsh = true;
-                                            renderer.set_spawn_dsh(true);
-                                            renderer.set_endpoint_text("启动中…".into());
-                                            spawn_dsh_task(
+                                        }
+                                        InstallPromptAction::Cancel => {
+                                            install_pending = false;
+                                            renderer.set_install_prompt(false);
+                                            renderer.set_endpoint_text("未安装 DSH".into());
+                                            renderer.set_status_bubble(Some(Bubble {
+                                                title: "已取消安装".to_string(),
+                                                body:
+                                                    "未安装 DSH，可稍后重新开启「由桌宠启动 DSH」"
+                                                        .to_string(),
+                                            }));
+                                            status_until =
+                                                Some(Instant::now() + Duration::from_secs(10));
+                                            window.request_redraw();
+                                        }
+                                        InstallPromptAction::None => {}
+                                    }
+                                } else if renderer.settings_visible() {
+                                    let (x, y) = input.cursor_position();
+                                    match renderer.settings_hit_test(x, y) {
+                                        SettingsHit::ToggleSound => {
+                                            // 点击开关前先提交 endpoint 编辑
+                                            commit_endpoint_if_focused(
+                                                &mut renderer,
+                                                &mut config,
+                                                &mut dsh_url,
+                                                &mut net_cancel,
                                                 &rt,
-                                                &proxy,
-                                                &dsh_child,
-                                                &dsh_gen,
-                                                dsh_gen.load(Ordering::SeqCst),
+                                                &http,
+                                                &event_tx,
                                             );
+                                            if !renderer.endpoint_focused() {
+                                                window.set_ime_allowed(false);
+                                            }
+                                            config.sound_on = !config.sound_on;
+                                            renderer.set_sound_on(config.sound_on);
+                                            if let Some(tray) = tray_ui.as_ref() {
+                                                tray.set_sound_on(config.sound_on);
+                                            }
+                                            config.save();
+                                        }
+                                        SettingsHit::EndpointInput => {
+                                            renderer.set_endpoint_focused(true);
+                                            window.set_ime_allowed(true);
+                                            if let Some((x, y, w, h)) = renderer.endpoint_ime_area()
+                                            {
+                                                window.set_ime_cursor_area(
+                                                    winit::dpi::PhysicalPosition::new(
+                                                        x as i32, y as i32,
+                                                    ),
+                                                    winit::dpi::PhysicalSize::new(
+                                                        w as u32, h as u32,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        SettingsHit::Close => {
+                                            // 关闭面板前丢弃 endpoint 编辑
+                                            renderer.set_endpoint_focused(false);
+                                            window.set_ime_allowed(false);
+                                            renderer.set_endpoint_text(dsh_url.clone());
+                                            renderer.set_settings_visible(false);
+                                        }
+                                        SettingsHit::SpawnDsh => {
+                                            if config.spawn_dsh {
+                                                // 关闭子进程模式：先弹面板内确认（不再用原生 MessageBox）
+                                                renderer.set_confirm_stop_dsh(true);
+                                                window.request_redraw();
+                                            } else {
+                                                // 开启子进程模式：地址框显示「启动中…」，后台拉起
+                                                config.spawn_dsh = true;
+                                                renderer.set_spawn_dsh(true);
+                                                renderer.set_endpoint_text("启动中…".into());
+                                                spawn_dsh_task(
+                                                    &rt,
+                                                    &proxy,
+                                                    &dsh_child,
+                                                    &dsh_gen,
+                                                    dsh_gen.load(Ordering::SeqCst),
+                                                );
+                                                config.save();
+                                                window.request_redraw();
+                                            }
+                                        }
+                                        SettingsHit::ConfirmStopDshYes => {
+                                            // 确认关闭：停止子进程，恢复手动地址
+                                            renderer.set_confirm_stop_dsh(false);
+                                            config.spawn_dsh = false;
+                                            renderer.set_spawn_dsh(false);
+                                            stop_dsh_child(&dsh_child, &dsh_gen);
+                                            let manual = config.normalized_endpoint();
+                                            if dsh_url != manual {
+                                                dsh_url = manual.clone();
+                                                renderer.set_endpoint_text(manual.clone());
+                                                net_cancel.cancel();
+                                                net_cancel = spawn_network_tasks(
+                                                    &rt,
+                                                    &dsh_url,
+                                                    &http,
+                                                    event_tx.clone(),
+                                                );
+                                            }
                                             config.save();
                                             window.request_redraw();
                                         }
-                                    }
-                                    SettingsHit::ConfirmStopDshYes => {
-                                        // 确认关闭：停止子进程，恢复手动地址
-                                        renderer.set_confirm_stop_dsh(false);
-                                        config.spawn_dsh = false;
-                                        renderer.set_spawn_dsh(false);
-                                        stop_dsh_child(&dsh_child, &dsh_gen);
-                                        let manual = config.normalized_endpoint();
-                                        if dsh_url != manual {
-                                            dsh_url = manual.clone();
-                                            renderer.set_endpoint_text(manual.clone());
-                                            net_cancel.cancel();
-                                            net_cancel = spawn_network_tasks(
-                                                &rt, &dsh_url, &http, event_tx.clone(),
-                                            );
-                                        }
-                                        config.save();
-                                        window.request_redraw();
-                                    }
-                                    SettingsHit::ConfirmStopDshNo => {
-                                        // 取消：保持开启
-                                        renderer.set_confirm_stop_dsh(false);
-                                        window.request_redraw();
-                                    }
-                                    SettingsHit::FrameRate30 => {
-                                        config.anim_fps = 30;
-                                        renderer.set_anim_fps(30);
-                                        config.save();
-                                        window.request_redraw();
-                                    }
-                                    SettingsHit::FrameRate60 => {
-                                        config.anim_fps = 60;
-                                        renderer.set_anim_fps(60);
-                                        config.save();
-                                        window.request_redraw();
-                                    }
-                                    SettingsHit::RestartDsh => {
-                                        // 重启桌宠托管的 DSH 子进程（仅 spawn_dsh 模式显示按钮）
-                                        if config.spawn_dsh {
-                                            stop_dsh_child(&dsh_child, &dsh_gen);
-                                            renderer.set_endpoint_text("重启中…".into());
-                                            spawn_dsh_task(
-                                                &rt,
-                                                &proxy,
-                                                &dsh_child,
-                                                &dsh_gen,
-                                                dsh_gen.load(Ordering::SeqCst),
-                                            );
+                                        SettingsHit::ConfirmStopDshNo => {
+                                            // 取消：保持开启
+                                            renderer.set_confirm_stop_dsh(false);
                                             window.request_redraw();
                                         }
-                                    }
-                                    SettingsHit::None => {
-                                        // 点击面板空白区域 → 提交 endpoint 编辑并失焦
-                                        commit_endpoint_if_focused(
-                                            &mut renderer,
-                                            &mut config,
-                                            &mut dsh_url,
-                                            &mut net_cancel,
-                                            &rt,
-                                            &http,
-                                            &event_tx,
-                                        );
-                                        if !renderer.endpoint_focused() {
-                                            window.set_ime_allowed(false);
+                                        SettingsHit::FrameRate30 => {
+                                            config.anim_fps = 30;
+                                            renderer.set_anim_fps(30);
+                                            config.save();
+                                            window.request_redraw();
+                                        }
+                                        SettingsHit::FrameRate60 => {
+                                            config.anim_fps = 60;
+                                            renderer.set_anim_fps(60);
+                                            config.save();
+                                            window.request_redraw();
+                                        }
+                                        SettingsHit::RestartDsh => {
+                                            // 重启桌宠托管的 DSH 子进程（仅 spawn_dsh 模式显示按钮）
+                                            if config.spawn_dsh {
+                                                stop_dsh_child(&dsh_child, &dsh_gen);
+                                                renderer.set_endpoint_text("重启中…".into());
+                                                spawn_dsh_task(
+                                                    &rt,
+                                                    &proxy,
+                                                    &dsh_child,
+                                                    &dsh_gen,
+                                                    dsh_gen.load(Ordering::SeqCst),
+                                                );
+                                                window.request_redraw();
+                                            }
+                                        }
+                                        SettingsHit::None => {
+                                            // 点击面板空白区域 → 提交 endpoint 编辑并失焦
+                                            commit_endpoint_if_focused(
+                                                &mut renderer,
+                                                &mut config,
+                                                &mut dsh_url,
+                                                &mut net_cancel,
+                                                &rt,
+                                                &http,
+                                                &event_tx,
+                                            );
+                                            if !renderer.endpoint_focused() {
+                                                window.set_ime_allowed(false);
+                                            }
                                         }
                                     }
+                                } else if renderer.status_bubble_visible() {
+                                    if progress_title.is_none() {
+                                        // 结果气泡：点击关闭
+                                        status_until = None;
+                                        renderer.set_status_bubble(None);
+                                    }
+                                    // 进度中：不跳转 Web
+                                    window.request_redraw();
+                                } else {
+                                    let _ = open::that(&dsh_url);
                                 }
-                            } else {
-                                let _ = open::that(&dsh_url);
                             }
-                        }
-                        InputAction::ContextMenu => {
-                            // 右键：托盘创建失败（如 Linux GNOME 无扩展）时打开面板内菜单；
-                            // 否则切换设置面板开/关（丢弃未提交的 endpoint 编辑）
-                            if renderer.menu_visible() {
-                                renderer.set_menu_visible(false);
-                            } else if tray_ui.is_none() {
-                                let (x, y) = input.cursor_position();
-                                renderer.open_menu(x as f32, y as f32);
-                            } else {
-                                renderer.set_endpoint_focused(false);
-                                window.set_ime_allowed(false);
-                                renderer.set_endpoint_text(dsh_url.clone());
-                                renderer.set_settings_visible(!renderer.settings_visible());
+                            InputAction::ContextMenu => {
+                                // 安装确认中：忽略右键，避免打断选择
+                                if renderer.install_prompt_visible() {
+                                    window.request_redraw();
+                                } else if renderer.menu_visible() {
+                                    renderer.set_menu_visible(false);
+                                } else if tray_ui.is_none() {
+                                    let (x, y) = input.cursor_position();
+                                    renderer.open_menu(x as f32, y as f32);
+                                } else {
+                                    renderer.set_endpoint_focused(false);
+                                    window.set_ime_allowed(false);
+                                    renderer.set_endpoint_text(dsh_url.clone());
+                                    renderer.set_settings_visible(!renderer.settings_visible());
+                                }
+                                window.request_redraw();
                             }
-                            window.request_redraw();
-                        }
                             _ => {}
                         }
                     }
@@ -686,11 +771,67 @@ fn main() -> anyhow::Result<()> {
                     net_cancel.cancel();
                     net_cancel = spawn_network_tasks(&rt, &dsh_url, &http, event_tx.clone());
                 }
+                progress_title = None;
+                progress_lines.clear();
+                status_until = None;
+                install_pending = false;
+                renderer.set_install_prompt(false);
+                renderer.set_status_bubble(None);
                 window.request_redraw();
             }
             Event::UserEvent(UserEvent::DshChildFailed(msg)) => {
                 tracing::error!("DSH 子进程启动失败: {msg}");
                 renderer.set_endpoint_text("启动失败".into());
+                progress_title = None;
+                progress_lines.clear();
+                install_pending = false;
+                renderer.set_install_prompt(false);
+                renderer.set_status_bubble(Some(Bubble {
+                    title: "启动 DSH 失败".to_string(),
+                    body: msg.clone(),
+                }));
+                status_until = Some(Instant::now() + Duration::from_secs(10));
+                window.request_redraw();
+            }
+            Event::UserEvent(UserEvent::ProgressStart { title }) => {
+                progress_title = Some(title.clone());
+                progress_lines.clear();
+                renderer.scroll_offset = 0.0;
+                renderer.set_settings_visible(false);
+                window.set_ime_allowed(false);
+                renderer.set_status_bubble(Some(Bubble {
+                    title,
+                    body: "…".to_string(),
+                }));
+                status_until = None;
+                window.request_redraw();
+            }
+            Event::UserEvent(UserEvent::ProgressLine(line)) => {
+                if let Some(title) = progress_title.clone() {
+                    progress_lines.push(line);
+                    const MAX_PROGRESS_LINES: usize = 10;
+                    if progress_lines.len() > MAX_PROGRESS_LINES {
+                        let remove = progress_lines.len() - MAX_PROGRESS_LINES;
+                        progress_lines.drain(0..remove);
+                    }
+                    renderer.set_status_bubble(Some(Bubble {
+                        title,
+                        body: progress_lines.join("\n"),
+                    }));
+                    window.request_redraw();
+                }
+            }
+            Event::UserEvent(UserEvent::InstallPrompt { errors }) => {
+                tracing::info!("未检测到 dsh，等待用户选择安装源: {errors}");
+                install_pending = true;
+                progress_title = None;
+                progress_lines.clear();
+                status_until = None;
+                renderer.scroll_offset = 0.0;
+                renderer.set_settings_visible(false);
+                renderer.set_status_bubble(None);
+                window.set_ime_allowed(false);
+                renderer.set_install_prompt(true);
                 window.request_redraw();
             }
             Event::AboutToWait => {
@@ -698,6 +839,14 @@ fn main() -> anyhow::Result<()> {
                     let _ = proxy.send_event(UserEvent::TrayAction(action));
                 }
                 let now = Instant::now();
+                // 结果气泡到期后清除，恢复普通状态气泡
+                if let Some(until) = status_until {
+                    if now >= until {
+                        status_until = None;
+                        renderer.set_status_bubble(None);
+                        window.request_redraw();
+                    }
+                }
                 // 透明区域点击穿透：低频轮询（穿透时窗口收不到鼠标事件，需靠轮询恢复命中）
                 if now.duration_since(last_poll) >= Duration::from_millis(CLICK_THROUGH_POLL_MS) {
                     last_poll = now;
@@ -879,13 +1028,13 @@ fn update_click_through(
         // 改为原生 SetWindowLong 只切换 WS_EX_TRANSPARENT，并强制保留 TOOLWINDOW。
         #[cfg(target_os = "windows")]
         {
-            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
             use windows::Win32::Foundation::HWND;
             use windows::Win32::UI::WindowsAndMessaging::{
                 GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED,
                 SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_LAYERED,
                 WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
             };
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
             if let Ok(handle) = window.window_handle() {
                 if let RawWindowHandle::Win32(w32) = handle.as_raw() {
                     let hwnd = HWND(w32.hwnd.get() as *mut _);
@@ -913,7 +1062,10 @@ fn update_click_through(
                                 0,
                                 0,
                                 0,
-                                SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED
+                                SWP_NOZORDER
+                                    | SWP_NOMOVE
+                                    | SWP_NOSIZE
+                                    | SWP_FRAMECHANGED
                                     | SWP_NOACTIVATE,
                             );
                         }
@@ -928,7 +1080,7 @@ fn update_click_through(
     }
 }
 
-/// 后台启动 DSH 子进程：内部级联尝试「dsh」→「npx @deepseek-ai/dsh」，
+/// 后台启动 DSH 子进程：先尝试 PATH 中的 dsh；缺失时通知事件循环弹窗选择安装源，
 /// 成功后把子进程放入共享槽并通知事件循环热切换连接。
 fn spawn_dsh_task(
     rt: &tokio::runtime::Runtime,
@@ -941,6 +1093,9 @@ fn spawn_dsh_task(
     let slot = slot.clone();
     let gen = gen.clone();
     rt.spawn(async move {
+        let _ = proxy.send_event(UserEvent::ProgressStart {
+            title: "启动 DSH".to_string(),
+        });
         match child_dsh::start().await {
             Ok(spawned) => {
                 if gen.load(Ordering::SeqCst) == generation {
@@ -951,12 +1106,65 @@ fn spawn_dsh_task(
                     drop(spawned.child);
                 }
             }
-            Err(msg) => {
+            Err(child_dsh::StartError::NotInstalled { errors }) => {
                 if gen.load(Ordering::SeqCst) == generation {
-                    tracing::error!("DSH 子进程启动失败: {msg}");
-                    let _ = proxy.send_event(UserEvent::DshChildFailed(msg));
+                    let _ = proxy.send_event(UserEvent::InstallPrompt {
+                        errors: errors.join("；"),
+                    });
                 }
             }
+        }
+    });
+}
+
+/// 按用户选择的安装源执行 `npm install -g @deepseek-ai/dsh --verbose`，
+/// 安装完成后重新尝试启动 DSH 子进程。
+fn spawn_install_and_retry_dsh(
+    rt: &tokio::runtime::Runtime,
+    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    slot: &Arc<Mutex<Option<child_dsh::ChildGuard>>>,
+    gen: &Arc<AtomicU64>,
+    generation: u64,
+    registry: child_dsh::Registry,
+) {
+    let proxy = proxy.clone();
+    let slot = slot.clone();
+    let gen = gen.clone();
+    rt.spawn(async move {
+        let _ = proxy.send_event(UserEvent::ProgressStart {
+            title: format!("正在安装 DSH（{}）", registry.label()),
+        });
+        let progress_proxy = proxy.clone();
+        let install_result = child_dsh::install(registry, move |line| {
+            let _ = progress_proxy.send_event(UserEvent::ProgressLine(line));
+        })
+        .await;
+        match install_result {
+            Err(err) => {
+                if gen.load(Ordering::SeqCst) == generation {
+                    let _ = proxy.send_event(UserEvent::DshChildFailed(format!(
+                        "安装失败：{err}"
+                    )));
+                }
+            }
+            Ok(()) => match child_dsh::start().await {
+                Ok(spawned) => {
+                    if gen.load(Ordering::SeqCst) == generation {
+                        *slot.lock().unwrap() = Some(spawned.child);
+                        let _ = proxy.send_event(UserEvent::DshChildUrl(spawned.url));
+                    } else {
+                        drop(spawned.child);
+                    }
+                }
+                Err(child_dsh::StartError::NotInstalled { .. }) => {
+                    if gen.load(Ordering::SeqCst) == generation {
+                        let _ = proxy.send_event(UserEvent::DshChildFailed(
+                            "安装已完成，但系统中仍找不到 dsh 命令，请检查 npm 全局 bin 是否在 PATH 中"
+                                .to_string(),
+                        ));
+                    }
+                }
+            },
         }
     });
 }
@@ -964,10 +1172,7 @@ fn spawn_dsh_task(
 /// 停止 DSH 子进程（若有），并让在途的启动任务失效（代际 +1）。
 /// ChildGuard 的 Drop 会同步 taskkill /T 杀进程树（含 cmd→node 整棵树），
 /// 因此无需阻塞/异步等待。
-fn stop_dsh_child(
-    slot: &Arc<Mutex<Option<child_dsh::ChildGuard>>>,
-    gen: &Arc<AtomicU64>,
-) {
+fn stop_dsh_child(slot: &Arc<Mutex<Option<child_dsh::ChildGuard>>>, gen: &Arc<AtomicU64>) {
     gen.fetch_add(1, Ordering::SeqCst);
     let child = slot.lock().unwrap().take();
     drop(child);

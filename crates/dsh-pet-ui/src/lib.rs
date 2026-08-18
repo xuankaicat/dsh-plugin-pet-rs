@@ -10,5 +10,5 @@ pub mod window;
 
 pub use emoji::EmojiAtlas;
 pub use input::{drag_delta, ClickTarget, InputAction, InputState};
-pub use renderer::{ContextMenuAction, Renderer, SettingsHit};
+pub use renderer::{ContextMenuAction, InstallPromptAction, Renderer, SettingsHit};
 pub use window::create_window;
