@@ -97,6 +97,8 @@ pub enum InstallPromptAction {
     Tencent,
     /// 取消安装
     Cancel,
+    /// 选择安装目录
+    PickDir,
 }
 
 /// 面板内右键菜单动作（托盘创建失败时的兜底菜单）。
@@ -163,6 +165,9 @@ pub struct Renderer {
     install_npmmirror_rect: Option<HitRect>,
     install_tencent_rect: Option<HitRect>,
     install_cancel_rect: Option<HitRect>,
+    install_pick_dir_rect: Option<HitRect>,
+    /// 当前选择的安装目录（None 表示使用默认位置）
+    install_dir_display: Option<String>,
 }
 
 impl Renderer {
@@ -211,6 +216,8 @@ impl Renderer {
             install_npmmirror_rect: None,
             install_tencent_rect: None,
             install_cancel_rect: None,
+            install_pick_dir_rect: None,
+            install_dir_display: None,
         }
     }
 
@@ -318,6 +325,7 @@ impl Renderer {
             self.install_npmmirror_rect = None;
             self.install_tencent_rect = None;
             self.install_cancel_rect = None;
+            self.install_pick_dir_rect = None;
             self.draw_settings(bubble_y, time_ms);
         } else if self.status_bubble.is_some()
             || self.bubble_visible
@@ -348,6 +356,7 @@ impl Renderer {
             self.install_npmmirror_rect = None;
             self.install_tencent_rect = None;
             self.install_cancel_rect = None;
+            self.install_pick_dir_rect = None;
             self.draw_bubble(&bubble_snapshot, anim_y, status_alpha, time_ms);
         } else {
             self.bubble_rect = None;
@@ -364,6 +373,7 @@ impl Renderer {
             self.install_npmmirror_rect = None;
             self.install_tencent_rect = None;
             self.install_cancel_rect = None;
+            self.install_pick_dir_rect = None;
         }
         self.draw_whale(snapshot, whale_y, time_ms);
 
@@ -902,10 +912,32 @@ impl Renderer {
             1.0,
         );
 
+        // ---- 选择安装目录 ----
+        let pick_rect = HitRect {
+            x: x + 14.0 * scale,
+            y: y + 126.0 * scale,
+            w: w - 28.0 * scale,
+            h: 26.0 * scale,
+        };
+        self.fill_rounded_rect(pick_rect, 6.0 * scale, Color::from_rgba8(52, 82, 168, 235));
+        let pick_label = match &self.install_dir_display {
+            Some(dir) => format!("选择安装目录…（{dir}）"),
+            None => "选择安装目录…（默认位置）".to_string(),
+        };
+        self.draw_text(
+            &pick_label,
+            pick_rect.x + 10.0 * scale,
+            pick_rect.y + 6.0 * scale,
+            12.0 * scale,
+            Color::from_rgba8(255, 255, 255, 235),
+            pick_rect.w - 20.0 * scale,
+            1.0,
+        );
+
         self.draw_text(
             "将写入 npm 全局目录",
             x + 14.0 * scale,
-            y + 142.0 * scale,
+            y + 160.0 * scale,
             11.0 * scale,
             Color::from_rgba8(255, 255, 255, 150),
             w - 28.0 * scale,
@@ -916,6 +948,7 @@ impl Renderer {
         self.install_npmmirror_rect = Some(npmmirror);
         self.install_tencent_rect = Some(tencent);
         self.install_cancel_rect = Some(cancel);
+        self.install_pick_dir_rect = Some(pick_rect);
     }
 
     fn draw_settings(&mut self, y: f32, time_ms: u64) {
@@ -1437,7 +1470,13 @@ impl Renderer {
             self.install_npmmirror_rect = None;
             self.install_tencent_rect = None;
             self.install_cancel_rect = None;
+            self.install_pick_dir_rect = None;
         }
+    }
+
+    /// 设置安装确认面板里显示的安装目录（None 表示默认位置）。
+    pub fn set_install_dir_display(&mut self, dir: Option<String>) {
+        self.install_dir_display = dir;
     }
 
     /// 查询坐标处的安装确认面板动作。
@@ -1465,6 +1504,11 @@ impl Renderer {
             .is_some_and(|rect| rect.contains(x, y))
         {
             InstallPromptAction::Cancel
+        } else if self
+            .install_pick_dir_rect
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            InstallPromptAction::PickDir
         } else {
             InstallPromptAction::None
         }

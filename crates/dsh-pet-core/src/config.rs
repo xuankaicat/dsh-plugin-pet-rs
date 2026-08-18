@@ -2,7 +2,7 @@
 //!
 //! 对应 main.js L15-46 的全局配置 + main.js L404-410 的 setPetScale。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,9 @@ pub struct Config {
     pub window_x: Option<i32>,
     #[serde(default)]
     pub window_y: Option<i32>,
+    /// npm 全局安装目录（None 表示 npm 默认位置；Windows 无值时默认 D:\dsh）
+    #[serde(default)]
+    pub install_dir: Option<String>,
 }
 
 impl Config {
@@ -96,6 +99,24 @@ impl Config {
     pub fn normalized_endpoint(&self) -> String {
         self.endpoint.trim().trim_end_matches('/').to_string()
     }
+
+    /// 实际使用的 DSH 安装目录：显式配置优先；
+    /// Windows 下未配置且存在 D 盘时默认 `D:\dsh`，否则返回 None（npm 默认位置）。
+    pub fn effective_install_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = self.install_dir.as_deref() {
+            let dir = dir.trim().trim_end_matches(['/', '\\']);
+            if !dir.is_empty() {
+                return Some(PathBuf::from(dir));
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if Path::new("D:\\").exists() {
+                return Some(PathBuf::from("D:\\dsh"));
+            }
+        }
+        None
+    }
 }
 
 impl Default for Config {
@@ -109,6 +130,7 @@ impl Default for Config {
             anim_fps: 30,
             window_x: None,
             window_y: None,
+            install_dir: None,
         }
     }
 }
@@ -163,5 +185,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.normalized_endpoint(), "http://localhost:3080");
+    }
+
+    #[test]
+    fn backward_compat_missing_install_dir() {
+        let json = r#"{"scale":0.67,"endpoint":"http://127.0.0.1:3080"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.install_dir.is_none());
+    }
+
+    #[test]
+    fn effective_install_dir_uses_explicit() {
+        let config = Config {
+            install_dir: Some("D:\\dsh".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.effective_install_dir(),
+            Some(PathBuf::from("D:\\dsh"))
+        );
     }
 }

@@ -56,6 +56,8 @@ enum UserEvent {
     ProgressLine(String),
     /// 未检测到 dsh，需要用户选择是否安装及安装源
     InstallPrompt { errors: String },
+    /// 用户选择了安装目录（None 表示取消选择）
+    InstallDirPicked(Option<String>),
 }
 
 /// 透明区域点击穿透的轮询间隔（毫秒）
@@ -218,6 +220,7 @@ fn main() -> anyhow::Result<()> {
             &dsh_child,
             &dsh_gen,
             dsh_gen.load(Ordering::SeqCst),
+            config.effective_install_dir(),
         );
     }
 
@@ -367,6 +370,7 @@ fn main() -> anyhow::Result<()> {
                                                         }
                                                         _ => child_dsh::Registry::Tencent,
                                                     };
+                                                let install_dir = config.effective_install_dir();
                                                 renderer.set_install_prompt(false);
                                                 spawn_install_and_retry_dsh(
                                                     &rt,
@@ -375,8 +379,13 @@ fn main() -> anyhow::Result<()> {
                                                     &dsh_gen,
                                                     dsh_gen.load(Ordering::SeqCst),
                                                     registry,
+                                                    install_dir,
                                                 );
                                             }
+                                            window.request_redraw();
+                                        }
+                                        InstallPromptAction::PickDir => {
+                                            spawn_dir_picker(&rt, &proxy);
                                             window.request_redraw();
                                         }
                                         InstallPromptAction::Cancel => {
@@ -457,6 +466,7 @@ fn main() -> anyhow::Result<()> {
                                                     &dsh_child,
                                                     &dsh_gen,
                                                     dsh_gen.load(Ordering::SeqCst),
+                                                    config.effective_install_dir(),
                                                 );
                                                 config.save();
                                                 window.request_redraw();
@@ -511,6 +521,7 @@ fn main() -> anyhow::Result<()> {
                                                     &dsh_child,
                                                     &dsh_gen,
                                                     dsh_gen.load(Ordering::SeqCst),
+                                                    config.effective_install_dir(),
                                                 );
                                                 window.request_redraw();
                                             }
@@ -831,7 +842,20 @@ fn main() -> anyhow::Result<()> {
                 renderer.set_settings_visible(false);
                 renderer.set_status_bubble(None);
                 window.set_ime_allowed(false);
+                let display_dir = config
+                    .effective_install_dir()
+                    .map(|p| p.to_string_lossy().into_owned());
+                renderer.set_install_dir_display(display_dir);
                 renderer.set_install_prompt(true);
+                window.request_redraw();
+            }
+            Event::UserEvent(UserEvent::InstallDirPicked(path)) => {
+                if let Some(path) = path {
+                    config.install_dir = Some(path.clone());
+                    config.save();
+                    renderer.set_install_dir_display(Some(path));
+                }
+                // None：用户取消了文件夹选择，保持原目录
                 window.request_redraw();
             }
             Event::AboutToWait => {
@@ -1088,6 +1112,7 @@ fn spawn_dsh_task(
     slot: &Arc<Mutex<Option<child_dsh::ChildGuard>>>,
     gen: &Arc<AtomicU64>,
     generation: u64,
+    custom_dir: Option<std::path::PathBuf>,
 ) {
     let proxy = proxy.clone();
     let slot = slot.clone();
@@ -1096,7 +1121,7 @@ fn spawn_dsh_task(
         let _ = proxy.send_event(UserEvent::ProgressStart {
             title: "启动 DSH".to_string(),
         });
-        match child_dsh::start().await {
+        match child_dsh::start(custom_dir.as_deref()).await {
             Ok(spawned) => {
                 if gen.load(Ordering::SeqCst) == generation {
                     *slot.lock().unwrap() = Some(spawned.child);
@@ -1126,6 +1151,7 @@ fn spawn_install_and_retry_dsh(
     gen: &Arc<AtomicU64>,
     generation: u64,
     registry: child_dsh::Registry,
+    install_dir: Option<std::path::PathBuf>,
 ) {
     let proxy = proxy.clone();
     let slot = slot.clone();
@@ -1135,7 +1161,7 @@ fn spawn_install_and_retry_dsh(
             title: format!("正在安装 DSH（{}）", registry.label()),
         });
         let progress_proxy = proxy.clone();
-        let install_result = child_dsh::install(registry, move |line| {
+        let install_result = child_dsh::install(registry, install_dir.as_deref(), move |line| {
             let _ = progress_proxy.send_event(UserEvent::ProgressLine(line));
         })
         .await;
@@ -1147,7 +1173,7 @@ fn spawn_install_and_retry_dsh(
                     )));
                 }
             }
-            Ok(()) => match child_dsh::start().await {
+            Ok(()) => match child_dsh::start(install_dir.as_deref()).await {
                 Ok(spawned) => {
                     if gen.load(Ordering::SeqCst) == generation {
                         *slot.lock().unwrap() = Some(spawned.child);
@@ -1166,6 +1192,22 @@ fn spawn_install_and_retry_dsh(
                 }
             },
         }
+    });
+}
+
+/// 弹出系统原生文件夹选择器，把选中的目录回传给事件循环。
+fn spawn_dir_picker(
+    rt: &tokio::runtime::Runtime,
+    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+) {
+    let proxy = proxy.clone();
+    rt.spawn(async move {
+        let picked = rfd::AsyncFileDialog::new()
+            .set_title("选择 DSH 安装目录")
+            .pick_folder()
+            .await;
+        let path = picked.map(|handle| handle.path().to_string_lossy().into_owned());
+        let _ = proxy.send_event(UserEvent::InstallDirPicked(path));
     });
 }
 

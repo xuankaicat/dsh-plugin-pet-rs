@@ -13,6 +13,7 @@
 //! 被占用时回退 `--port 0` 由系统分配空闲端口；实际地址由子进程 stdout
 //! 输出一行 `dsh web: http://127.0.0.1:<port>`，本模块负责解析。
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -112,13 +113,13 @@ impl Drop for ChildGuard {
     }
 }
 
-/// 启动 DSH：只尝试 PATH 中已有的 dsh；找不到则返回 `NotInstalled`，
-/// 由上层弹窗让用户选择是否安装及安装源。
-pub async fn start() -> Result<SpawnedDsh, StartError> {
+/// 启动 DSH：先找 PATH 中的 dsh，再找自定义安装目录里的 dsh；
+/// 找不到则返回 `NotInstalled`，由上层弹窗让用户选择是否安装及安装源。
+pub async fn start(custom_dir: Option<&Path>) -> Result<SpawnedDsh, StartError> {
     let mut errors: Vec<String> = Vec::new();
 
     for port in [PREFERRED_PORT, FALLBACK_PORT] {
-        if let Some(spawned) = try_existing_candidates(port, &mut errors).await {
+        if let Some(spawned) = try_existing_candidates(port, custom_dir, &mut errors).await {
             return Ok(spawned);
         }
     }
@@ -126,9 +127,13 @@ pub async fn start() -> Result<SpawnedDsh, StartError> {
     Err(StartError::NotInstalled { errors })
 }
 
-/// 尝试已安装的 dsh：直接执行（Unix；Windows 上若存在 dsh.exe 也可用），
-/// Windows 再尝试 `cmd /C dsh`（解析 npm 全局安装产生的 dsh.cmd shim）。
-async fn try_existing_candidates(port: &str, errors: &mut Vec<String>) -> Option<SpawnedDsh> {
+/// 尝试已安装的 dsh：PATH 中的 `dsh` / Windows `cmd /C dsh`，
+/// 以及自定义安装目录（`--prefix` 目录）中的 dsh 可执行文件。
+async fn try_existing_candidates(
+    port: &str,
+    custom_dir: Option<&Path>,
+    errors: &mut Vec<String>,
+) -> Option<SpawnedDsh> {
     let args = ["--profile", "web", "--host", "127.0.0.1", "--port", port];
 
     match try_launch("dsh", &args, DIRECT_TIMEOUT).await {
@@ -146,15 +151,66 @@ async fn try_existing_candidates(port: &str, errors: &mut Vec<String>) -> Option
         }
     }
 
+    if let Some(dir) = custom_dir {
+        for candidate in custom_dsh_candidates(dir) {
+            let program = candidate.to_string_lossy().into_owned();
+            match try_launch(&program, &args, DIRECT_TIMEOUT).await {
+                Ok(s) => return Some(s),
+                Err(e) => errors.push(e),
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // npm --prefix 在 Windows 生成的 dsh.cmd shim 需经 cmd /C 执行
+            let cmd_script = dir.join("dsh.cmd");
+            if cmd_script.exists() {
+                let script = cmd_script.to_string_lossy().into_owned();
+                let mut cmd_args: Vec<&str> = vec!["/C", &script];
+                cmd_args.extend_from_slice(&args);
+                match try_launch("cmd", &cmd_args, DIRECT_TIMEOUT).await {
+                    Ok(s) => return Some(s),
+                    Err(e) => errors.push(e),
+                }
+            }
+        }
+    }
+
     None
 }
 
-/// npm 全局安装 @deepseek-ai/dsh（指定安装源），并逐行回传 --verbose 下载进度。
-pub async fn install<F>(registry: Registry, on_line: F) -> Result<(), String>
+/// 自定义安装目录中的 dsh 可执行文件候选。
+fn custom_dsh_candidates(dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        candidates.push(dir.join("dsh.exe"));
+        candidates.push(dir.join("dsh"));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        candidates.push(dir.join("bin").join("dsh"));
+        candidates.push(dir.join("dsh"));
+    }
+    candidates
+}
+
+/// npm 全局安装 @deepseek-ai/dsh（指定安装源与可选安装目录），并逐行回传下载进度。
+pub async fn install<F>(
+    registry: Registry,
+    install_dir: Option<&Path>,
+    on_line: F,
+) -> Result<(), String>
 where
     F: Fn(String) + Send + Sync + 'static,
 {
-    let status = npm_install_status(registry, &on_line).await?;
+    if let Some(dir) = install_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return Err(format!("创建安装目录失败: {e}"));
+        }
+    }
+    let args = install_args(registry, install_dir);
+    let status = npm_install_status(&args, &on_line).await?;
     if status.success() {
         Ok(())
     } else {
@@ -168,29 +224,38 @@ where
     }
 }
 
+/// 构造 npm 安装参数，可选追加 `--prefix <目录>`。
+pub fn install_args(registry: Registry, install_dir: Option<&Path>) -> Vec<String> {
+    let mut args = vec![
+        "install".to_string(),
+        "-g".to_string(),
+        "@deepseek-ai/dsh".to_string(),
+        "--verbose".to_string(),
+        "--registry".to_string(),
+        registry.url().to_string(),
+    ];
+    if let Some(dir) = install_dir {
+        args.push("--prefix".to_string());
+        args.push(dir.to_string_lossy().into_owned());
+    }
+    args
+}
+
 async fn npm_install_status<F>(
-    registry: Registry,
+    args: &[String],
     on_line: &F,
 ) -> Result<std::process::ExitStatus, String>
 where
     F: Fn(String) + Send + Sync + 'static,
 {
-    let args = [
-        "install",
-        "-g",
-        "@deepseek-ai/dsh",
-        "--verbose",
-        "--registry",
-        registry.url(),
-    ];
-    match run_streaming("npm", &args, on_line).await {
+    match run_streaming("npm", args, on_line).await {
         Ok(status) => Ok(status),
         Err(_e) => {
             #[cfg(target_os = "windows")]
             {
                 on_line("npm 不在 PATH，尝试 cmd /C npm…".to_string());
-                let mut cmd_args = vec!["/C", "npm"];
-                cmd_args.extend_from_slice(&args);
+                let mut cmd_args = vec!["/C".to_string(), "npm".to_string()];
+                cmd_args.extend(args.iter().cloned());
                 run_streaming("cmd", &cmd_args, on_line).await
             }
             #[cfg(not(target_os = "windows"))]
@@ -204,14 +269,14 @@ where
 /// 运行一个命令，合并 stdout/stderr 并逐行交给回调，返回进程退出状态。
 async fn run_streaming<F>(
     program: &str,
-    args: &[&str],
+    args: &[String],
     on_line: &F,
 ) -> Result<std::process::ExitStatus, String>
 where
     F: Fn(String) + Send + Sync + 'static,
 {
     let mut cmd = Command::new(program);
-    cmd.args(args)
+    cmd.args(args.iter().map(|s| s.as_str()))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -341,6 +406,19 @@ fn extract_url(line: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn install_args_without_dir() {
+        let args = install_args(Registry::Official, None);
+        assert!(!args.iter().any(|a| a == "--prefix"));
+    }
+
+    #[test]
+    fn install_args_with_dir() {
+        let args = install_args(Registry::Npmmirror, Some(Path::new("D:\\dsh")));
+        let idx = args.iter().position(|a| a == "--prefix").unwrap();
+        assert_eq!(args[idx + 1], "D:\\dsh");
+    }
 
     #[test]
     fn extracts_url_from_banner() {
